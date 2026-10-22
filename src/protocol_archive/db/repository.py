@@ -117,6 +117,25 @@ class Repository:
     def __init__(self, conn: sqlite3.Connection):
         self.conn = conn
 
+    def _text_condition(self, text: str, id_column: str):
+        """SQL-условие «документ содержит все слова запроса» или None для пустого запроса.
+
+        Возвращает (sql, args); при запросе без слов — ("0", []) (ничего не найдено).
+        """
+        words = re.findall(r"\w+", text.lower(), flags=re.UNICODE)
+        if not text.strip():
+            return None
+        if not words:
+            return "0", []
+        if has_fts(self.conn):
+            return (f"{id_column} IN (SELECT rowid FROM document_texts_fts"
+                    " WHERE document_texts_fts MATCH ?)", [_fts_query(text)])
+        # запасной вариант без FTS5: все слова как подстроки
+        sql = " AND ".join(
+            f"{id_column} IN (SELECT document_id FROM document_texts"
+            " WHERE ulower(text) LIKE ? ESCAPE '\\')" for _ in words)
+        return sql, ["%" + _escape_like(w) + "%" for w in words]
+
     # ----- документы -----------------------------------------------------
 
     @staticmethod
@@ -174,10 +193,14 @@ class Repository:
         ).fetchall()
         return [self._doc(r) for r in rows]
 
-    def list_documents(self, status: str = "", name_contains: str = "",
+    def list_documents(self, status: str = "", name_contains: str = "", text: str = "",
                        limit: int = 1000, offset: int = 0) -> List[Document]:
         sql = "SELECT * FROM documents WHERE 1=1"
         args: list = []
+        cond = self._text_condition(text, "id")
+        if cond:
+            sql += " AND " + cond[0]
+            args += cond[1]
         if status:
             sql += " AND status=?"
             args.append(status)
@@ -230,6 +253,23 @@ class Repository:
                 " extracted_at=excluded.extracted_at",
                 (doc_id, text, source, _now()),
             )
+
+    def delete_document_text(self, doc_id: int) -> None:
+        with self.conn:
+            self.conn.execute("DELETE FROM document_texts WHERE document_id=?", (doc_id,))
+
+    def get_document_text_info(self, doc_id: int):
+        """(текст, источник, время извлечения) или None."""
+        row = self.conn.execute(
+            "SELECT text, source, extracted_at FROM document_texts WHERE document_id=?",
+            (doc_id,)).fetchone()
+        return (row["text"], row["source"], row["extracted_at"]) if row else None
+
+    def list_document_ids(self, statuses: Sequence[str]) -> List[int]:
+        marks = ",".join("?" * len(statuses))
+        rows = self.conn.execute(
+            f"SELECT id FROM documents WHERE status IN ({marks}) ORDER BY id", list(statuses))
+        return [r["id"] for r in rows.fetchall()]
 
     def get_document_text(self, doc_id: int) -> Optional[str]:
         row = self.conn.execute(
@@ -333,23 +373,10 @@ class Repository:
             where.append("p.status = ?")
             args.append(flt.status)
 
-        if flt.text.strip():
-            if has_fts(self.conn):
-                query = _fts_query(flt.text)
-                if not query:
-                    return []
-                where.append(
-                    "p.document_id IN (SELECT rowid FROM document_texts_fts"
-                    " WHERE document_texts_fts MATCH ?)"
-                )
-                args.append(query)
-            else:  # запасной вариант без FTS5: все слова как подстроки
-                for word in re.findall(r"\w+", flt.text.lower(), flags=re.UNICODE):
-                    where.append(
-                        "p.document_id IN (SELECT document_id FROM document_texts"
-                        " WHERE ulower(text) LIKE ? ESCAPE '\\')"
-                    )
-                    args.append("%" + _escape_like(word) + "%")
+        cond = self._text_condition(flt.text, "p.document_id")
+        if cond:
+            where.append(cond[0])
+            args += cond[1]
 
         sql = (
             "SELECT p.*, d.path AS _doc_path, d.file_name AS _doc_name "

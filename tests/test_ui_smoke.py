@@ -89,3 +89,98 @@ def test_no_vehicle_plate_in_ui(window):
                for i in range(window.protocol_table.columnCount())]
     assert "Госномер" not in headers and "Тип лица" in headers
     assert not hasattr(window, "f_plate")
+
+
+# ----- этап 2: обработка документов через окно ---------------------------------------
+
+import time  # noqa: E402
+
+import samples  # noqa: E402
+from PySide6.QtWidgets import QDialog, QMessageBox, QPlainTextEdit  # noqa: E402
+
+
+def _wait_processing(window, qapp, timeout=60):
+    deadline = time.time() + timeout
+    while window.is_processing() and time.time() < deadline:
+        qapp.processEvents()
+        time.sleep(0.01)
+    qapp.processEvents()
+    assert not window.is_processing(), "обработка не завершилась вовремя"
+
+
+@pytest.fixture
+def quiet(monkeypatch):
+    """Подавляет модальные окна и запоминает их тексты."""
+    shown = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: shown.append(a[2]))
+    monkeypatch.setattr(QMessageBox, "warning", lambda *a, **k: shown.append(a[2]))
+    monkeypatch.setattr(QMessageBox, "critical", lambda *a, **k: shown.append(a[2]))
+    return shown
+
+
+def test_processing_in_background_thread_updates_window(window, qapp, tmp_path, quiet):
+    good = samples.make_docx(tmp_path / "a.docx")
+    bad = tmp_path / "bad.pdf"
+    bad.write_bytes(b"%PDF-1.4 garbage")
+    window.add_documents([str(good), str(bad)])
+
+    window.process_pending()
+    _wait_processing(window, qapp)
+
+    statuses = {window.document_table.item(r, 0).text(): window.document_table.item(r, 3).text()
+                for r in range(window.document_table.rowCount())}
+    assert statuses == {"a.docx": "Обработан", "bad.pdf": "Ошибка обработки"}
+    messages = {window.document_table.item(r, 0).text(): window.document_table.item(r, 4).text()
+                for r in range(window.document_table.rowCount())}
+    assert messages["bad.pdf"] and messages["a.docx"] == ""
+    assert window.last_summary.processed == 1 and window.last_summary.failed == 1
+    assert "С ошибками: 1" in quiet[-1] and "bad.pdf" in quiet[-1]
+
+
+def test_text_search_on_documents_tab(window, qapp, tmp_path, quiet):
+    window.add_documents([str(samples.make_docx(tmp_path / "a.docx")),
+                          str(samples.make_odt(tmp_path / "b.odt"))])
+    window.process_pending()
+    _wait_processing(window, qapp)
+    window.doc_query.setText("объединённая")
+    window.refresh_documents()
+    assert [window.document_table.item(r, 0).text() for r in range(window.document_table.rowCount())] == ["a.docx"]
+    window.doc_query.setText("b.odt")           # поиск по имени файла
+    window.refresh_documents()
+    assert [window.document_table.item(r, 0).text() for r in range(window.document_table.rowCount())] == ["b.odt"]
+    window.reset_document_search()
+    assert window.document_table.rowCount() == 2
+
+
+def test_process_pending_with_nothing_to_do(window, quiet):
+    window.process_pending()
+    assert "Нет документов" in quiet[-1] and not window.is_processing()
+
+
+def test_show_text_requires_processed_document(window, tmp_path, quiet, monkeypatch):
+    window.add_documents([str(samples.make_docx(tmp_path / "a.docx"))])
+    window.document_table.selectRow(0)
+    window.show_document_text()
+    assert "ещё не извлечён" in quiet[-1]
+
+
+def test_show_text_dialog_after_processing(window, qapp, tmp_path, quiet, monkeypatch):
+    window.add_documents([str(samples.make_docx(tmp_path / "a.docx"))])
+    window.document_table.selectRow(0)
+    window.process_selected()
+    _wait_processing(window, qapp)
+    opened = []
+    monkeypatch.setattr(QDialog, "exec", lambda self: opened.append(self) or 0)
+    window.document_table.selectRow(0)
+    window.show_document_text()
+    assert len(opened) == 1
+    assert "ТЕСТ-001" in opened[0].findChild(QPlainTextEdit).toPlainText()
+
+
+def test_window_does_not_modify_originals_during_processing(window, qapp, tmp_path, quiet):
+    f = samples.make_docx(tmp_path / "a.docx")
+    before = (f.read_bytes(), f.stat().st_mtime_ns)
+    window.add_documents([str(f)])
+    window.process_pending()
+    _wait_processing(window, qapp)
+    assert (f.read_bytes(), f.stat().st_mtime_ns) == before

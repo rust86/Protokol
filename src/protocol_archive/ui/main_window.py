@@ -3,11 +3,11 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from PySide6.QtCore import Qt, QUrl
+from PySide6.QtCore import QThread, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
-    QComboBox, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QPushButton, QTableWidget,
+    QComboBox, QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressDialog, QPushButton, QTableWidget,
     QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget, QDialog,
 )
 
@@ -18,7 +18,10 @@ from ..db import (
     BackupError, ProtocolFilter, Repository, connect, create_backup, list_backups,
 )
 from ..envcheck import check_all, format_report
+from ..extract import OcrOptions
+from ..processing import ProcessSummary
 from .dialogs import OFFENDER_TYPE_LABELS, STATUS_LABELS, ProtocolDialog
+from .worker import ProcessWorker
 
 DOC_STATUS_LABELS = {
     "new": "Добавлен, не обработан",
@@ -28,9 +31,9 @@ DOC_STATUS_LABELS = {
 }
 SUPPORTED_EXTENSIONS = "Документы (*.pdf *.docx *.odt *.doc);;Все файлы (*)"
 NOT_IMPLEMENTED_NOTE = (
-    "Автоматическое извлечение текста и реквизитов (PDF, OCR, DOCX/ODT/DOC) пока не "
-    "реализовано — это этап 2. Сейчас документы только регистрируются по пути, "
-    "а реквизиты протоколов вносятся вручную."
+    "Текст документов (PDF, сканы через OCR, DOCX, ODT, DOC) извлекается кнопкой «Обработать» "
+    "на вкладке «Документы». Автоматическое извлечение реквизитов протокола пока не "
+    "реализовано (этап 3): реквизиты вносятся вручную."
 )
 
 
@@ -45,7 +48,7 @@ def _item(text: str, data=None) -> QTableWidgetItem:
 class MainWindow(QMainWindow):
     PROTOCOL_COLUMNS = ["№ протокола", "Дата протокола", "Дата нарушения", "Статья", "Тип лица",
                         "ФИО / наименование", "Место нарушения", "Статус записи", "Документ"]
-    DOCUMENT_COLUMNS = ["Файл", "Тип", "Размер, байт", "Статус", "Добавлен", "Путь"]
+    DOCUMENT_COLUMNS = ["Файл", "Тип", "Размер, байт", "Статус", "Сообщение", "Добавлен", "Путь"]
 
     def __init__(self, db_path: Path):
         super().__init__()
@@ -92,8 +95,6 @@ class MainWindow(QMainWindow):
         note.setStyleSheet("background:#fff4d6; border:1px solid #e0c36a; padding:6px;")
         root.addWidget(note)
 
-        root.addWidget(self._build_search_box())
-
         self.tabs = QTabWidget()
         self.tabs.addTab(self._build_protocols_tab(), "Протоколы")
         self.tabs.addTab(self._build_documents_tab(), "Документы")
@@ -102,6 +103,9 @@ class MainWindow(QMainWindow):
 
         self.status_label = QLabel()
         self.statusBar().addPermanentWidget(self.status_label)
+        self._thread = None
+        self._worker = None
+        self._progress = None
 
     def _build_search_box(self) -> QGroupBox:
         box = QGroupBox("Поиск протоколов")
@@ -161,6 +165,7 @@ class MainWindow(QMainWindow):
     def _build_protocols_tab(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addWidget(self._build_search_box())
         self.protocol_table = self._make_table(self.PROTOCOL_COLUMNS)
         self.protocol_table.doubleClicked.connect(lambda _i: self.edit_protocol())
         lay.addWidget(self.protocol_table)
@@ -181,11 +186,28 @@ class MainWindow(QMainWindow):
     def _build_documents_tab(self) -> QWidget:
         w = QWidget()
         lay = QVBoxLayout(w)
+        find_row = QHBoxLayout()
+        find_row.addWidget(QLabel("Найти документы по тексту или имени файла:"))
+        self.doc_query = QLineEdit()
+        self.doc_query.setPlaceholderText("слова из текста документа или часть имени файла")
+        self.doc_query.returnPressed.connect(self.refresh_documents)
+        find_row.addWidget(self.doc_query, 1)
+        b_find = QPushButton("Найти")
+        b_find.clicked.connect(self.refresh_documents)
+        b_clear = QPushButton("Сбросить")
+        b_clear.clicked.connect(self.reset_document_search)
+        find_row.addWidget(b_find)
+        find_row.addWidget(b_clear)
+        lay.addLayout(find_row)
         self.document_table = self._make_table(self.DOCUMENT_COLUMNS)
+        self.document_table.doubleClicked.connect(lambda _i: self.show_document_text())
         lay.addWidget(self.document_table)
         row = QHBoxLayout()
         for text, slot in (
             ("Добавить документы…", self.add_documents_dialog),
+            ("Обработать выбранный", self.process_selected),
+            ("Обработать все новые и с ошибками", self.process_pending),
+            ("Показать текст", self.show_document_text),
             ("Удалить из базы", self.delete_document),
             ("Проверить наличие файлов", self.check_missing),
             ("Открыть оригинал", self.open_document_original),
@@ -241,12 +263,17 @@ class MainWindow(QMainWindow):
         self._update_status()
 
     def refresh_documents(self) -> None:
-        docs = self.repo.list_documents()
+        query = self.doc_query.text().strip()
+        docs = self.repo.list_documents(text=query) if query else self.repo.list_documents()
+        if query:  # слова из запроса могут быть и частью имени файла
+            seen = {d.id for d in docs}
+            docs += [d for d in self.repo.list_documents(name_contains=query) if d.id not in seen]
         t = self.document_table
         t.setRowCount(len(docs))
         for i, d in enumerate(docs):
             values = [d.file_name, d.extension.upper(), str(d.size_bytes),
-                      DOC_STATUS_LABELS.get(d.status, d.status), d.added_at, d.path]
+                      DOC_STATUS_LABELS.get(d.status, d.status), d.error_message or "",
+                      d.added_at, d.path]
             for c, v in enumerate(values):
                 t.setItem(i, c, _item(v, d.id if c == 0 else None))
         t.resizeColumnsToContents()
@@ -275,6 +302,8 @@ class MainWindow(QMainWindow):
         if paths:
             self.add_documents(paths)
 
+    last_summary = None
+
     def add_documents(self, paths: Iterable[str]) -> List[str]:
         """Регистрирует файлы. Возвращает список сообщений об ошибках (пустой при успехе)."""
         errors: List[str] = []
@@ -296,6 +325,116 @@ class MainWindow(QMainWindow):
         if not rows:
             return None
         return table.item(rows[0].row(), 0).data(Qt.UserRole)
+
+    def reset_document_search(self) -> None:
+        self.doc_query.clear()
+        self.refresh_documents()
+
+    # ----- обработка документов (фоновый поток) --------------------------------
+
+    def process_selected(self) -> None:
+        doc_id = self._selected_id(self.document_table)
+        if doc_id is None:
+            QMessageBox.information(self, "Обработка", "Выберите документ в таблице.")
+            return
+        self.start_processing([doc_id])
+
+    def process_pending(self) -> None:
+        ids = self.repo.list_document_ids(("new", "error"))
+        if not ids:
+            QMessageBox.information(self, "Обработка", "Нет документов, ожидающих обработки.")
+            return
+        self.start_processing(ids)
+
+    def is_processing(self) -> bool:
+        return self._thread is not None
+
+    def start_processing(self, doc_ids, options: Optional[OcrOptions] = None) -> None:
+        if self.is_processing():
+            return
+        worker = ProcessWorker(self.db_path, doc_ids, options or OcrOptions())
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_processing_finished)
+        worker.finished.connect(thread.quit)
+        thread.finished.connect(thread.deleteLater)
+
+        dlg = QProgressDialog("Подготовка…", "Отмена", 0, len(doc_ids), self)
+        dlg.setWindowTitle("Обработка документов")
+        dlg.setWindowModality(Qt.ApplicationModal)  # пока идёт обработка, правки блокируются
+        dlg.setMinimumDuration(0)
+        dlg.setAutoClose(False)
+        dlg.setAutoReset(False)
+        dlg.canceled.connect(worker.cancel_event.set)
+        worker.progress.connect(self._on_processing_progress)
+
+        self._thread, self._worker, self._progress = thread, worker, dlg
+        dlg.show()
+        thread.start()
+
+    def _on_processing_progress(self, done: int, total: int, name: str) -> None:
+        if self._progress is not None:
+            self._progress.setMaximum(total)
+            self._progress.setValue(done)
+            if name:
+                self._progress.setLabelText(f"Обрабатывается ({done + 1} из {total}):\n{name}\n"
+                                            "Сканы распознаются медленно — это нормально.")
+
+    def _on_processing_finished(self, result) -> None:
+        if self._progress is not None:
+            self._progress.close()
+            self._progress.deleteLater()
+        thread = self._thread
+        self._progress = self._worker = self._thread = None
+        if thread is not None:
+            thread.wait(5000)
+        self.refresh_all()
+        if isinstance(result, Exception):
+            QMessageBox.critical(self, "Обработка", f"Обработка прервана ошибкой:\n{result}")
+            return
+        self.last_summary = result
+        self._show_summary(result)
+
+    def _show_summary(self, s: ProcessSummary) -> None:
+        lines = [f"Обработано успешно: {s.processed}", f"С ошибками: {s.failed}"]
+        if s.cancelled:
+            lines.append("Обработка отменена пользователем; необработанные остались в очереди.")
+        for o in [o for o in s.outcomes if not o.ok][:10]:
+            lines.append(f"• {o.file_name}: {o.message}")
+        ocr = [o for o in s.outcomes if o.ok and o.source in ("ocr", "pdf-text+ocr")]
+        if ocr:
+            lines.append(f"Распознано OCR: {len(ocr)} док. Текст OCR может содержать ошибки — "
+                         "проверяйте реквизиты по оригиналу.")
+        QMessageBox.information(self, "Обработка завершена", "\n".join(lines))
+
+    def show_document_text(self) -> None:
+        doc_id = self._selected_id(self.document_table)
+        info = self.repo.get_document_text_info(doc_id) if doc_id is not None else None
+        if doc_id is None:
+            QMessageBox.information(self, "Текст документа", "Выберите документ в таблице.")
+            return
+        if info is None:
+            QMessageBox.information(self, "Текст документа",
+                                    "Для этого документа текст ещё не извлечён. Нажмите «Обработать».")
+            return
+        text, source, extracted_at = info
+        doc = self.repo.get_document(doc_id)
+        pages = text.split("\f")
+        body = "\n\n".join(f"──── страница {i} ────\n{p}" for i, p in enumerate(pages, 1)) \
+            if len(pages) > 1 else text
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Текст: {doc.file_name}")
+        dlg.resize(820, 600)
+        lay = QVBoxLayout(dlg)
+        lay.addWidget(QLabel(f"Источник: {source}    Извлечён: {extracted_at}"))
+        view = QPlainTextEdit(body)
+        view.setReadOnly(True)
+        lay.addWidget(view)
+        close = QPushButton("Закрыть")
+        close.clicked.connect(dlg.accept)
+        lay.addWidget(close)
+        dlg.exec()
 
     def delete_document(self) -> None:
         doc_id = self._selected_id(self.document_table)
@@ -392,6 +531,9 @@ class MainWindow(QMainWindow):
             self.open_database(Path(path))
 
     def open_database(self, path: Path) -> None:
+        if self.is_processing():
+            QMessageBox.information(self, "База данных", "Дождитесь окончания обработки документов.")
+            return
         try:
             new_conn = connect(path)
         except Exception as exc:
@@ -436,13 +578,18 @@ class MainWindow(QMainWindow):
     def show_about(self) -> None:
         QMessageBox.about(
             self, "О программе",
-            f"{APP_NAME}, версия {__version__} (MVP, этап 1)\n\n"
+            f"{APP_NAME}, версия {__version__} (MVP, этап 2)\n\n"
             "Локальный архив протоколов об административных правонарушениях.\n"
             "Работает без облачных сервисов и без ИИ-моделей. Оригиналы не копируются "
             "и не изменяются; в базе хранятся извлечённые сведения и пути к файлам.\n\n"
             + NOT_IMPLEMENTED_NOTE)
 
     def closeEvent(self, event) -> None:
+        if self._worker is not None:
+            self._worker.cancel_event.set()
+        if self._thread is not None:
+            self._thread.quit()
+            self._thread.wait(10000)
         try:
             self.conn.close()
         finally:

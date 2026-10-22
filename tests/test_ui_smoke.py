@@ -184,3 +184,71 @@ def test_window_does_not_modify_originals_during_processing(window, qapp, tmp_pa
     window.process_pending()
     _wait_processing(window, qapp)
     assert (f.read_bytes(), f.stat().st_mtime_ns) == before
+
+
+# ----- этап 3: извлечение реквизитов через окно ----------------------------------------------
+
+def _odt_from_sample(path):
+    from odf.opendocument import OpenDocumentText
+    from odf.text import P
+    from pathlib import Path as _P
+    odt = OpenDocumentText()
+    text = (_P(__file__).parent / "data" / "protocol_legal_entity.txt").read_text(encoding="utf-8")
+    for line in text.split("\n"):
+        odt.text.addElement(P(text=line))
+    odt.save(str(path))
+    return path
+
+
+def test_extract_requisites_from_window(window, qapp, tmp_path, quiet, monkeypatch):
+    window.add_documents([str(_odt_from_sample(tmp_path / "п.odt"))])
+    window.process_pending()
+    _wait_processing(window, qapp)
+
+    window.extract_pending_requisites()
+    assert "Создано или обновлено протоколов: 1 из 1" in quiet[-1]
+    assert "Дата нарушения взята как дата контрольных действий" in quiet[-1]
+    assert "пересечения улиц" in quiet[-1]          # предупреждение о местах без номера дома
+    t = window.protocol_table
+    assert t.rowCount() == 1
+    row = [t.item(0, c).text() for c in range(t.columnCount())]
+    assert row[0] == "86 НН 000001" and row[1] == "06.02.2026" and row[2] == "05.02.2026"
+    assert row[6] == "ул. Тестовой д. 8"
+    assert row[7] == "п. 8.1 ГОСТ Р 50597-2017; п. 8.8 ГОСТ Р 50597-2017"
+    assert row[4] == "Юридическое лицо" and "Тестовое управление" in row[5]
+    assert row[8] == "Извлечён автоматически"
+    assert t.columnCount() == 10
+    assert t.horizontalHeaderItem(7).text() == "Нарушенные пункты ГОСТ"
+
+    window.f_gost.setText("8.8")
+    window.refresh_protocols()
+    assert t.rowCount() == 1
+    window.f_gost.setText("5.2.4")
+    window.refresh_protocols()
+    assert t.rowCount() == 0
+
+    # повторная кнопка: все обработанные документы уже с протоколом
+    window.extract_pending_requisites()
+    assert "Нет обработанных документов без протокола" in quiet[-1]
+
+
+def test_protocol_dialog_shows_evidence(window, qapp, tmp_path, quiet, monkeypatch):
+    window.add_documents([str(_odt_from_sample(tmp_path / "п.odt"))])
+    window.process_pending()
+    _wait_processing(window, qapp)
+    window.extract_pending_requisites()
+    opened = []
+    monkeypatch.setattr(QDialog, "exec", lambda self: opened.append(self) or 0)
+    window.protocol_table.selectRow(0)
+    window.edit_protocol()
+    box = [w for w in opened[0].findChildren(QPlainTextEdit) if w.isReadOnly()][0]
+    assert "Статья: ч. 1 ст. 12.34 КоАП РФ" in box.toPlainText()
+    assert "нарушение, предусмотренное" in box.toPlainText()
+    assert "Тип лица: Юридическое лицо" in box.toPlainText() and "legal_entity" not in box.toPlainText()
+
+
+def test_extract_requisites_for_unprocessed_document(window, tmp_path, quiet):
+    window.add_documents([str(_odt_from_sample(tmp_path / "п.odt"))])
+    window.document_table.selectRow(0)
+    window.extract_selected_requisites()
+    assert "текст не извлечён" in quiet[-1] and window.protocol_table.rowCount() == 0

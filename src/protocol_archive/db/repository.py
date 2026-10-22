@@ -68,6 +68,7 @@ class Protocol:
     offender_type: Optional[str] = None   # 'official' | 'legal_entity' | None (не указан)
     offender_name: Optional[str] = None
     location: Optional[str] = None
+    gost_norms: Optional[str] = None      # «п. 5.2.4 ГОСТ Р 50597-2017; п. 8.8 …»
     authority: Optional[str] = None
     notes: Optional[str] = None
     status: str = "manual"
@@ -77,7 +78,7 @@ class Protocol:
 
 _PROTOCOL_EDITABLE = [
     "protocol_number", "protocol_date", "violation_date", "article",
-    "offender_type", "offender_name", "location", "authority", "notes", "status",
+    "offender_type", "offender_name", "location", "gost_norms", "authority", "notes", "status",
 ]
 
 
@@ -90,6 +91,7 @@ class ProtocolFilter:
     offender_name: str = ""           # подстрока
     offender_type: str = ""           # 'official' | 'legal_entity' | '' (любой)
     location: str = ""                # подстрока
+    gost: str = ""                    # подстрока в нарушенных пунктах ГОСТ
     date_from: Optional[str] = None   # protocol_date >= (ГГГГ-ММ-ДД)
     date_to: Optional[str] = None     # protocol_date <= (ГГГГ-ММ-ДД)
     status: str = ""
@@ -333,6 +335,31 @@ class Repository:
         row = self.conn.execute("SELECT * FROM protocols WHERE id=?", (protocol_id,)).fetchone()
         return self._protocol(row) if row else None
 
+    def list_protocols_for_document(self, doc_id: int) -> List[Protocol]:
+        rows = self.conn.execute(
+            "SELECT * FROM protocols WHERE document_id=? ORDER BY id", (doc_id,)).fetchall()
+        return [self._protocol(r) for r in rows]
+
+    def set_evidence(self, protocol_id: int, items: Sequence[tuple]) -> None:
+        """Заменяет записи о происхождении значений. items: (поле, значение, фрагмент, правило)."""
+        with self.conn:
+            self.conn.execute("DELETE FROM protocol_evidence WHERE protocol_id=?", (protocol_id,))
+            self.conn.executemany(
+                "INSERT INTO protocol_evidence(protocol_id,field,value,evidence,rule)"
+                " VALUES(?,?,?,?,?)", [(protocol_id, *it) for it in items])
+
+    def get_evidence(self, protocol_id: int) -> List[tuple]:
+        rows = self.conn.execute(
+            "SELECT field,value,evidence,rule FROM protocol_evidence WHERE protocol_id=? ORDER BY id",
+            (protocol_id,)).fetchall()
+        return [tuple(r) for r in rows]
+
+    def list_document_ids_without_protocol(self, status: str = "processed") -> List[int]:
+        rows = self.conn.execute(
+            "SELECT d.id FROM documents d WHERE d.status=? AND NOT EXISTS"
+            " (SELECT 1 FROM protocols p WHERE p.document_id=d.id) ORDER BY d.id", (status,))
+        return [r["id"] for r in rows.fetchall()]
+
     def delete_protocol(self, protocol_id: int) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM protocols WHERE id=?", (protocol_id,))
@@ -351,6 +378,7 @@ class Repository:
             ("article", flt.article),
             ("offender_name", flt.offender_name),
             ("location", flt.location),
+            ("gost_norms", flt.gost),
         ):
             if value.strip():
                 where.append(f"ulower(p.{column}) LIKE ? ESCAPE '\\'")

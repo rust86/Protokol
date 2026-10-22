@@ -19,6 +19,7 @@ from ..db import (
 )
 from ..envcheck import check_all, format_report
 from ..extract import OcrOptions
+from ..parsing import FIELD_LABELS, extract_requisites
 from ..processing import ProcessSummary
 from .dialogs import OFFENDER_TYPE_LABELS, STATUS_LABELS, ProtocolDialog
 from .worker import ProcessWorker
@@ -31,9 +32,9 @@ DOC_STATUS_LABELS = {
 }
 SUPPORTED_EXTENSIONS = "Документы (*.pdf *.docx *.odt *.doc);;Все файлы (*)"
 NOT_IMPLEMENTED_NOTE = (
-    "Текст документов (PDF, сканы через OCR, DOCX, ODT, DOC) извлекается кнопкой «Обработать» "
-    "на вкладке «Документы». Автоматическое извлечение реквизитов протокола пока не "
-    "реализовано (этап 3): реквизиты вносятся вручную."
+    "Вкладка «Документы»: «Обработать» извлекает текст (PDF, сканы через OCR, DOCX, ODT, DOC), "
+    "«Извлечь реквизиты» заполняет номер, даты, статью, тип и наименование лица, орган, место "
+    "нарушения и нарушенные пункты ГОСТ по правилам; всё извлечённое проверяйте по оригиналу."
 )
 
 
@@ -47,7 +48,8 @@ def _item(text: str, data=None) -> QTableWidgetItem:
 
 class MainWindow(QMainWindow):
     PROTOCOL_COLUMNS = ["№ протокола", "Дата протокола", "Дата нарушения", "Статья", "Тип лица",
-                        "ФИО / наименование", "Место нарушения", "Статус записи", "Документ"]
+                        "ФИО / наименование", "Место нарушения", "Нарушенные пункты ГОСТ",
+                        "Статус записи", "Документ"]
     DOCUMENT_COLUMNS = ["Файл", "Тип", "Размер, байт", "Статус", "Сообщение", "Добавлен", "Путь"]
 
     def __init__(self, db_path: Path):
@@ -120,6 +122,8 @@ class MainWindow(QMainWindow):
         for key, label in OFFENDER_TYPE_LABELS.items():
             self.f_type.addItem(label, key)
         self.f_location = QLineEdit()
+        self.f_gost = QLineEdit()
+        self.f_gost.setPlaceholderText("например, 8.8 или 50597")
         self.f_from = QLineEdit()
         self.f_from.setPlaceholderText("ДД.ММ.ГГГГ")
         self.f_to = QLineEdit()
@@ -129,7 +133,7 @@ class MainWindow(QMainWindow):
         grid.addWidget(self.f_text, 0, 1, 1, 5)
         rows = [
             [("№ протокола:", self.f_number), ("Статья:", self.f_article), ("ФИО / наименование:", self.f_offender)],
-            [("Тип лица:", self.f_type), ("Место:", self.f_location)],
+            [("Тип лица:", self.f_type), ("Место:", self.f_location), ("Пункт ГОСТ:", self.f_gost)],
             [("Дата протокола с:", self.f_from), ("по:", self.f_to)],
         ]
         for r, pairs in enumerate(rows, start=1):
@@ -137,7 +141,7 @@ class MainWindow(QMainWindow):
                 grid.addWidget(QLabel(label), r, 2 * k)
                 grid.addWidget(widget, r, 2 * k + 1)
         for w in (self.f_text, self.f_number, self.f_article, self.f_offender,
-                  self.f_location, self.f_from, self.f_to):
+                  self.f_location, self.f_gost, self.f_from, self.f_to):
             w.returnPressed.connect(self.refresh_protocols)
         self.f_type.currentIndexChanged.connect(lambda _i: self.refresh_protocols())
         btn_find = QPushButton("Найти")
@@ -208,6 +212,8 @@ class MainWindow(QMainWindow):
             ("Обработать выбранный", self.process_selected),
             ("Обработать все новые и с ошибками", self.process_pending),
             ("Показать текст", self.show_document_text),
+            ("Извлечь реквизиты", self.extract_selected_requisites),
+            ("Извлечь реквизиты у всех обработанных без протокола", self.extract_pending_requisites),
             ("Удалить из базы", self.delete_document),
             ("Проверить наличие файлов", self.check_missing),
             ("Открыть оригинал", self.open_document_original),
@@ -233,6 +239,7 @@ class MainWindow(QMainWindow):
             offender_name=self.f_offender.text(),
             offender_type=self.f_type.currentData() or "",
             location=self.f_location.text(),
+            gost=self.f_gost.text(),
             date_from=to_iso(self.f_from.text()),
             date_to=to_iso(self.f_to.text()),
         )
@@ -254,7 +261,7 @@ class MainWindow(QMainWindow):
             values = [p.protocol_number, to_display(p.protocol_date),
                       to_display(p.violation_date), p.article,
                       OFFENDER_TYPE_LABELS.get(p.offender_type or "", ""), p.offender_name,
-                      p.location, STATUS_LABELS.get(p.status, p.status),
+                      p.location, p.gost_norms, STATUS_LABELS.get(p.status, p.status),
                       r.document_name]
             for c, v in enumerate(values):
                 t.setItem(i, c, _item(v or "", p.id if c == 0 else None))
@@ -290,7 +297,7 @@ class MainWindow(QMainWindow):
         self.f_type.setCurrentIndex(0)
         self.f_type.blockSignals(False)
         for w in (self.f_text, self.f_number, self.f_article, self.f_offender,
-                  self.f_location, self.f_from, self.f_to):
+                  self.f_location, self.f_gost, self.f_from, self.f_to):
             w.clear()
         self.refresh_protocols()
 
@@ -408,6 +415,45 @@ class MainWindow(QMainWindow):
                          "проверяйте реквизиты по оригиналу.")
         QMessageBox.information(self, "Обработка завершена", "\n".join(lines))
 
+    # ----- извлечение реквизитов -------------------------------------------------
+
+    def extract_selected_requisites(self) -> None:
+        doc_id = self._selected_id(self.document_table)
+        if doc_id is None:
+            QMessageBox.information(self, "Реквизиты", "Выберите документ в таблице.")
+            return
+        self._run_requisites([doc_id])
+
+    def extract_pending_requisites(self) -> None:
+        ids = self.repo.list_document_ids_without_protocol("processed")
+        if not ids:
+            QMessageBox.information(self, "Реквизиты",
+                                    "Нет обработанных документов без протокола.")
+            return
+        self._run_requisites(ids)
+
+    def _run_requisites(self, doc_ids) -> None:
+        outcomes = [extract_requisites(self.repo, i) for i in doc_ids]
+        self.refresh_all()
+        self.last_requisites = outcomes
+        done = [o for o in outcomes if o.ok]
+        lines = [f"Создано или обновлено протоколов: {len(done)} из {len(outcomes)}.",
+                 "Записи получили статус «Извлечён автоматически» — сверьте их с оригиналом."]
+        for o in outcomes:
+            if not o.ok:
+                lines.append(f"• {o.file_name}: {o.message}")
+            else:
+                if o.missing:
+                    names = ", ".join(FIELD_LABELS.get(k, k) for k in o.missing)
+                    lines.append(f"• {o.file_name}: не найдено — {names}")
+                lines += [f"• {o.file_name}: {w}" for w in o.warnings]
+        lines.append("Дата нарушения взята как дата контрольных действий; место — адреса вида "
+                     "«ул. … д. N» из описания нарушения; пункты ГОСТ — из фраз «в нарушение…» "
+                     "и «нарушены требования…».")
+        QMessageBox.information(self, "Извлечение реквизитов", "\n".join(lines))
+
+    last_requisites = None
+
     def show_document_text(self) -> None:
         doc_id = self._selected_id(self.document_table)
         info = self.repo.get_document_text_info(doc_id) if doc_id is not None else None
@@ -486,7 +532,8 @@ class MainWindow(QMainWindow):
         if protocol is None:
             QMessageBox.information(self, "Протокол", "Выберите протокол в таблице.")
             return
-        dlg = ProtocolDialog(self.repo.list_documents(), protocol, parent=self)
+        dlg = ProtocolDialog(self.repo.list_documents(), protocol, parent=self,
+                             evidence=self.repo.get_evidence(protocol.id))
         if dlg.exec() == QDialog.Accepted and dlg.result_protocol:
             try:
                 self.repo.update_protocol(dlg.result_protocol)
@@ -578,7 +625,7 @@ class MainWindow(QMainWindow):
     def show_about(self) -> None:
         QMessageBox.about(
             self, "О программе",
-            f"{APP_NAME}, версия {__version__} (MVP, этап 2)\n\n"
+            f"{APP_NAME}, версия {__version__} (MVP, этап 3)\n\n"
             "Локальный архив протоколов об административных правонарушениях.\n"
             "Работает без облачных сервисов и без ИИ-моделей. Оригиналы не копируются "
             "и не изменяются; в базе хранятся извлечённые сведения и пути к файлам.\n\n"

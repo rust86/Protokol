@@ -5,7 +5,7 @@
 """
 from __future__ import annotations
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 4
 
 # Допустимые значения статусов (проверяются CHECK-ограничениями).
 DOCUMENT_STATUSES = ("new", "processed", "error", "missing")
@@ -43,6 +43,7 @@ CREATE TABLE IF NOT EXISTS protocols (
                       CHECK (offender_type IS NULL OR offender_type IN ('official','legal_entity')),
     offender_name     TEXT,                         -- ФИО должностного лица или наименование юрлица
     location          TEXT,
+    gost_norms        TEXT,                         -- нарушенные пункты ГОСТ, через «; »
     authority         TEXT,                         -- орган, составивший протокол
     notes             TEXT,
     status            TEXT NOT NULL DEFAULT 'manual'
@@ -55,6 +56,17 @@ CREATE INDEX IF NOT EXISTS idx_protocols_document ON protocols(document_id);
 CREATE INDEX IF NOT EXISTS idx_protocols_number   ON protocols(protocol_number);
 CREATE INDEX IF NOT EXISTS idx_protocols_date     ON protocols(protocol_date);
 CREATE INDEX IF NOT EXISTS idx_protocols_article  ON protocols(article);
+
+-- Откуда программа взяла автоматически извлечённые значения (для проверки по оригиналу).
+CREATE TABLE IF NOT EXISTS protocol_evidence (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    protocol_id INTEGER NOT NULL REFERENCES protocols(id) ON DELETE CASCADE,
+    field       TEXT    NOT NULL,                   -- имя поля протокола
+    value       TEXT    NOT NULL,                   -- извлечённое значение
+    evidence    TEXT    NOT NULL,                   -- фрагмент исходного текста
+    rule        TEXT    NOT NULL                    -- идентификатор правила
+);
+CREATE INDEX IF NOT EXISTS idx_evidence_protocol ON protocol_evidence(protocol_id);
 
 -- Текст, извлечённый из оригинала (для полнотекстового поиска).
 CREATE TABLE IF NOT EXISTS document_texts (
@@ -132,6 +144,28 @@ MIGRATIONS = {
     CREATE INDEX IF NOT EXISTS idx_protocols_date     ON protocols(protocol_date);
     CREATE INDEX IF NOT EXISTS idx_protocols_article  ON protocols(article);
     PRAGMA user_version = 2;
+    COMMIT;
+    """,
+    # v2 -> v3: таблица происхождения автоматически извлечённых значений.
+    2: """
+    BEGIN;
+    CREATE TABLE IF NOT EXISTS protocol_evidence (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        protocol_id INTEGER NOT NULL REFERENCES protocols(id) ON DELETE CASCADE,
+        field       TEXT    NOT NULL,
+        value       TEXT    NOT NULL,
+        evidence    TEXT    NOT NULL,
+        rule        TEXT    NOT NULL
+    );
+    CREATE INDEX IF NOT EXISTS idx_evidence_protocol ON protocol_evidence(protocol_id);
+    PRAGMA user_version = 3;
+    COMMIT;
+    """,
+    # v3 -> v4: нарушенные пункты ГОСТ.
+    3: """
+    BEGIN;
+    ALTER TABLE protocols ADD COLUMN gost_norms TEXT;
+    PRAGMA user_version = 4;
     COMMIT;
     """,
 }

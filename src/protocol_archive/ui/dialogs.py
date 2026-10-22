@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import List, Optional
 
 from PySide6.QtWidgets import (
-    QComboBox, QDialog, QDialogButtonBox, QFormLayout, QLineEdit, QMessageBox,
+    QComboBox, QDialog, QDialogButtonBox, QLabel, QFormLayout, QLineEdit, QMessageBox,
     QPlainTextEdit, QVBoxLayout,
 )
 
@@ -26,10 +26,10 @@ class ProtocolDialog(QDialog):
     """Ручной ввод и правка реквизитов протокола."""
 
     def __init__(self, documents: List[Document], protocol: Optional[Protocol] = None,
-                 parent=None):
+                 parent=None, evidence: Optional[list] = None):
         super().__init__(parent)
         self.setWindowTitle("Протокол" if protocol else "Новый протокол")
-        self.setMinimumWidth(520)
+        self.setMinimumWidth(720)
         self._protocol = protocol
 
         self.doc_box = QComboBox()
@@ -53,6 +53,8 @@ class ProtocolDialog(QDialog):
         for key, label in OFFENDER_TYPE_LABELS.items():
             self.offender_type.addItem(label, key)
         self.location = QLineEdit()
+        self.gost = QLineEdit()
+        self.gost.setPlaceholderText("п. 5.2.4 ГОСТ Р 50597-2017; п. 8.8 ГОСТ Р 50597-2017")
         self.authority = QLineEdit()
         self.status = QComboBox()
         for key, label in STATUS_LABELS.items():
@@ -69,6 +71,7 @@ class ProtocolDialog(QDialog):
         form.addRow("Тип лица:", self.offender_type)
         form.addRow("ФИО должностного лица / наименование юрлица:", self.offender)
         form.addRow("Место нарушения:", self.location)
+        form.addRow("Нарушенные пункты ГОСТ:", self.gost)
         form.addRow("Орган, составивший протокол:", self.authority)
         form.addRow("Статус записи:", self.status)
         form.addRow("Примечание:", self.notes)
@@ -81,6 +84,20 @@ class ProtocolDialog(QDialog):
 
         layout = QVBoxLayout(self)
         layout.addLayout(form)
+        if evidence:
+            from ..parsing import FIELD_LABELS
+            box = QPlainTextEdit()
+            box.setReadOnly(True)
+            box.setFixedHeight(130)
+            box.setPlainText("\n".join(
+                f"{FIELD_LABELS.get(f, f)}: {OFFENDER_TYPE_LABELS.get(v, v) if f == 'offender_type' else v}"
+                f"\n    ← «{ev}» [{rule}]"
+                for f, v, ev, rule in evidence))
+            hint = QLabel("Автоматически извлечено из текста документа. Сверьте с оригиналом, "
+                          "затем поставьте статус «Проверен».")
+            hint.setWordWrap(True)
+            layout.addWidget(hint)
+            layout.addWidget(box)
         layout.addWidget(buttons)
 
         if protocol:
@@ -91,6 +108,7 @@ class ProtocolDialog(QDialog):
             self.offender.setText(protocol.offender_name or "")
             self.offender_type.setCurrentIndex(max(0, self.offender_type.findData(protocol.offender_type)))
             self.location.setText(protocol.location or "")
+            self.gost.setText(protocol.gost_norms or "")
             self.authority.setText(protocol.authority or "")
             self.notes.setPlainText(protocol.notes or "")
             self.status.setCurrentIndex(max(0, self.status.findData(protocol.status)))
@@ -112,6 +130,7 @@ class ProtocolDialog(QDialog):
                 offender_name=self.offender.text(),
                 offender_type=self.offender_type.currentData(),
                 location=self.location.text(),
+                gost_norms=self.gost.text(),
                 authority=self.authority.text(),
                 notes=self.notes.toPlainText(),
                 status=self.status.currentData(),

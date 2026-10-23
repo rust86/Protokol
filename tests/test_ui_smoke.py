@@ -206,7 +206,7 @@ def test_extract_requisites_from_window(window, qapp, tmp_path, quiet, monkeypat
     _wait_processing(window, qapp)
 
     window.extract_pending_requisites()
-    assert "Создано или обновлено протоколов: 1 из 1" in quiet[-1]
+    assert "Создано протоколов: 1, обновлено: 0, не удалось: 0 (из 1 документов)" in quiet[-1]
     assert "Дата нарушения взята как дата контрольных действий" in quiet[-1]
     assert "пересечения улиц" in quiet[-1]          # предупреждение о местах без номера дома
     t = window.protocol_table
@@ -227,9 +227,18 @@ def test_extract_requisites_from_window(window, qapp, tmp_path, quiet, monkeypat
     window.refresh_protocols()
     assert t.rowCount() == 0
 
-    # повторная кнопка: все обработанные документы уже с протоколом
+    # повторная кнопка пересчитывает автоматически извлечённые протоколы (после обновления правил)
+    window.reset_search()
     window.extract_pending_requisites()
-    assert "Нет обработанных документов без протокола" in quiet[-1]
+    assert "Создано протоколов: 0, обновлено: 1" in quiet[-1]
+    assert window.protocol_table.rowCount() == 1
+
+    # проверенный протокол больше не пересчитывается
+    p = window.repo.list_protocols_for_document(window.repo.list_documents()[0].id)[0]
+    p.status = "verified"
+    window.repo.update_protocol(p)
+    window.extract_pending_requisites()
+    assert "Нет обработанных документов, для которых можно извлечь" in quiet[-1]
 
 
 def test_protocol_dialog_shows_evidence(window, qapp, tmp_path, quiet, monkeypatch):
@@ -245,6 +254,9 @@ def test_protocol_dialog_shows_evidence(window, qapp, tmp_path, quiet, monkeypat
     assert "Статья: ч. 1 ст. 12.34 КоАП РФ" in box.toPlainText()
     assert "нарушение, предусмотренное" in box.toPlainText()
     assert "Тип лица: Юридическое лицо" in box.toPlainText() and "legal_entity" not in box.toPlainText()
+    text = box.toPlainText()
+    assert "Дата нарушения: 05.02.2026\n" in text and "Дата протокола: 06.02.2026\n" in text
+    assert "2026-02-05" not in text and "2026-02-06" not in text
 
 
 def test_extract_requisites_for_unprocessed_document(window, tmp_path, quiet):
@@ -252,3 +264,79 @@ def test_extract_requisites_for_unprocessed_document(window, tmp_path, quiet):
     window.document_table.selectRow(0)
     window.extract_selected_requisites()
     assert "текст не извлечён" in quiet[-1] and window.protocol_table.rowCount() == 0
+
+
+# ----- перенос длинного текста в ячейках ----------------------------------------------------
+
+def _settle(qapp, ms=250):
+    end = time.time() + ms / 1000
+    while time.time() < end:
+        qapp.processEvents()
+        time.sleep(0.01)
+
+
+def _long_protocol(window, tmp_path):
+    f = tmp_path / "d.pdf"
+    f.write_bytes(b"x")
+    window.add_documents([str(f)])
+    doc = window.repo.list_documents()[0]
+    window.repo.add_protocol(Protocol(
+        document_id=doc.id, protocol_number="ТЕСТ-001",
+        location="ул. Тестовая д. 1; " * 12,
+        gost_norms="п. 5.2.4 ГОСТ Р 50597-2017; п. 8.8 ГОСТ Р 50597-2017; " * 4))
+    window.refresh_all()
+
+
+def test_long_text_wraps_and_rows_follow_column_width(window, qapp, tmp_path):
+    from PySide6.QtCore import Qt
+    _long_protocol(window, tmp_path)
+    t = window.protocol_table
+    assert t.wordWrap() and t.textElideMode() == Qt.ElideNone    # перенос, а не «…»
+    col = window.PROTOCOL_COLUMNS.index("Место нарушения")
+
+    t.setColumnWidth(col, 1800)
+    _settle(qapp)
+    wide = t.rowHeight(0)
+    t.setColumnWidth(col, 90)
+    _settle(qapp)
+    narrow = t.rowHeight(0)
+    assert narrow > wide * 3, (wide, narrow)       # строка выросла, текст виден целиком
+    t.setColumnWidth(col, 1800)
+    _settle(qapp)
+    assert t.rowHeight(0) == wide                  # и вернулась обратно
+
+
+def test_initial_column_width_is_capped_so_long_text_wraps(window, tmp_path):
+    from protocol_archive.ui.main_window import MAX_COLUMN_WIDTH
+    _long_protocol(window, tmp_path)
+    t = window.protocol_table
+    assert all(t.columnWidth(c) <= MAX_COLUMN_WIDTH for c in range(t.columnCount() - 1))
+    base = t.fontMetrics().height()
+    assert t.rowHeight(0) > base * 3               # длинные ячейки уже перенесены
+
+
+def test_documents_table_wraps_long_unbroken_path(window, qapp, tmp_path):
+    deep = tmp_path
+    for _ in range(4):                       # длинный путь без пробелов из вложенных папок
+        deep = deep / "очень_длинное_имя_папки_без_пробелов"
+    deep.mkdir(parents=True)
+    f = deep / "документ.pdf"
+    f.write_bytes(b"x")
+    window.add_documents([str(f)])
+    t = window.document_table
+    path_col = window.DOCUMENT_COLUMNS.index("Путь")
+    t.setColumnWidth(path_col, 120)
+    _settle(qapp)
+    assert t.rowHeight(0) > t.fontMetrics().height() * 3
+
+
+def test_wrapped_pdf_through_the_window_shows_violation_date(window, qapp, tmp_path, quiet):
+    pdf = samples.make_wrapped_pdf(tmp_path / "п.pdf")
+    window.add_documents([str(pdf)])
+    window.process_pending()
+    _wait_processing(window, qapp)
+    window.extract_pending_requisites()
+    t = window.protocol_table
+    col = window.PROTOCOL_COLUMNS.index("Дата нарушения")
+    assert t.item(0, col).text() == "05.02.2026"      # только дата, без фразы
+    assert "не найдено" not in quiet[-1] or "Дата нарушения" not in quiet[-1]

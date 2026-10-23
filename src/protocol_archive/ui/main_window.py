@@ -3,7 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Iterable, List, Optional
 
-from PySide6.QtCore import QThread, Qt, QUrl
+from PySide6.QtCore import QThread, QTimer, Qt, QUrl
 from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QAbstractItemView, QApplication, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
@@ -36,6 +36,18 @@ NOT_IMPLEMENTED_NOTE = (
     "«Извлечь реквизиты» заполняет номер, даты, статью, тип и наименование лица, орган, место "
     "нарушения и нарушенные пункты ГОСТ по правилам; всё извлечённое проверяйте по оригиналу."
 )
+
+
+MAX_COLUMN_WIDTH = 380  # начальная ширина колонки не больше этой; дальше длинный текст переносится
+
+
+def _fit_table(table: QTableWidget) -> None:
+    """Подгоняет колонки под содержимое (но не шире MAX_COLUMN_WIDTH) и высоту строк под перенос."""
+    table.resizeColumnsToContents()
+    for col in range(table.columnCount()):
+        if table.columnWidth(col) > MAX_COLUMN_WIDTH:
+            table.setColumnWidth(col, MAX_COLUMN_WIDTH)
+    table.resizeRowsToContents()
 
 
 def _item(text: str, data=None) -> QTableWidgetItem:
@@ -164,6 +176,16 @@ class MainWindow(QMainWindow):
         t.setAlternatingRowColors(True)
         t.horizontalHeader().setStretchLastSection(True)
         t.setSortingEnabled(False)
+        # Длинный текст переносится по ширине колонки (а не обрезается «…»); при изменении
+        # ширины колонки или окна высота строк пересчитывается.
+        t.setWordWrap(True)
+        t.setTextElideMode(Qt.ElideNone)
+        timer = QTimer(t)
+        timer.setSingleShot(True)
+        timer.setInterval(30)
+        timer.timeout.connect(t.resizeRowsToContents)
+        t.horizontalHeader().sectionResized.connect(lambda *_: timer.start())
+        t._relayout_timer = timer
         return t
 
     def _build_protocols_tab(self) -> QWidget:
@@ -213,7 +235,7 @@ class MainWindow(QMainWindow):
             ("Обработать все новые и с ошибками", self.process_pending),
             ("Показать текст", self.show_document_text),
             ("Извлечь реквизиты", self.extract_selected_requisites),
-            ("Извлечь реквизиты у всех обработанных без протокола", self.extract_pending_requisites),
+            ("Извлечь реквизиты у всех обработанных", self.extract_pending_requisites),
             ("Удалить из базы", self.delete_document),
             ("Проверить наличие файлов", self.check_missing),
             ("Открыть оригинал", self.open_document_original),
@@ -266,7 +288,7 @@ class MainWindow(QMainWindow):
             for c, v in enumerate(values):
                 t.setItem(i, c, _item(v or "", p.id if c == 0 else None))
             t.item(i, 0).setData(Qt.UserRole + 1, r.document_path)
-        t.resizeColumnsToContents()
+        _fit_table(t)
         self._update_status()
 
     def refresh_documents(self) -> None:
@@ -283,7 +305,7 @@ class MainWindow(QMainWindow):
                       d.added_at, d.path]
             for c, v in enumerate(values):
                 t.setItem(i, c, _item(v, d.id if c == 0 else None))
-        t.resizeColumnsToContents()
+        _fit_table(t)
         self._update_status()
 
     def _update_status(self) -> None:
@@ -425,10 +447,12 @@ class MainWindow(QMainWindow):
         self._run_requisites([doc_id])
 
     def extract_pending_requisites(self) -> None:
-        ids = self.repo.list_document_ids_without_protocol("processed")
+        ids = self.repo.list_document_ids_for_extraction()
         if not ids:
             QMessageBox.information(self, "Реквизиты",
-                                    "Нет обработанных документов без протокола.")
+                                    "Нет обработанных документов, для которых можно извлечь "
+                                    "реквизиты (протоколы, внесённые вручную или проверенные, "
+                                    "не пересчитываются).")
             return
         self._run_requisites(ids)
 
@@ -436,9 +460,12 @@ class MainWindow(QMainWindow):
         outcomes = [extract_requisites(self.repo, i) for i in doc_ids]
         self.refresh_all()
         self.last_requisites = outcomes
-        done = [o for o in outcomes if o.ok]
-        lines = [f"Создано или обновлено протоколов: {len(done)} из {len(outcomes)}.",
-                 "Записи получили статус «Извлечён автоматически» — сверьте их с оригиналом."]
+        created = sum(1 for o in outcomes if o.status == "created")
+        updated = sum(1 for o in outcomes if o.status == "updated")
+        lines = [f"Создано протоколов: {created}, обновлено: {updated}, "
+                 f"не удалось: {len(outcomes) - created - updated} (из {len(outcomes)} документов).",
+                 "Записи имеют статус «Извлечён автоматически» — сверьте их с оригиналом. "
+                 "Значения, изменённые вами вручную, при пересчёте сохраняются."]
         for o in outcomes:
             if not o.ok:
                 lines.append(f"• {o.file_name}: {o.message}")

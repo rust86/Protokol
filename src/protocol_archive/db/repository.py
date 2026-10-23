@@ -360,6 +360,17 @@ class Repository:
             " (SELECT 1 FROM protocols p WHERE p.document_id=d.id) ORDER BY d.id", (status,))
         return [r["id"] for r in rows.fetchall()]
 
+    def list_document_ids_for_extraction(self) -> List[int]:
+        """Обработанные документы, у которых нет протокола или есть автоматически извлечённый
+        (его можно пересчитать). Документы с протоколом, внесённым вручную или проверенным,
+        сюда не входят."""
+        rows = self.conn.execute(
+            "SELECT d.id FROM documents d WHERE d.status='processed' AND ("
+            " NOT EXISTS (SELECT 1 FROM protocols p WHERE p.document_id=d.id)"
+            " OR EXISTS (SELECT 1 FROM protocols p WHERE p.document_id=d.id AND p.status='extracted'))"
+            " ORDER BY d.id")
+        return [r["id"] for r in rows.fetchall()]
+
     def delete_protocol(self, protocol_id: int) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM protocols WHERE id=?", (protocol_id,))

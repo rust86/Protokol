@@ -42,7 +42,8 @@ def extract_requisites(repo: Repository, doc_id: int) -> RequisitesOutcome:
     * Нет текста — ничего не делаем (сначала нужна обработка документа).
     * Нашлось ноль полей — запись не создаётся.
     * У документа уже есть протокол, внесённый вручную или проверенный, — не трогаем его.
-    * Ранее извлечённая автоматически запись (статус «extracted») обновляется заново.
+    * Ранее извлечённая автоматически запись (статус «extracted») обновляется заново; поля,
+      которые вы изменили вручную, при этом сохраняются.
     Статус «Проверен» программа сама никогда не ставит.
     """
     doc = repo.get_document(doc_id)
@@ -74,8 +75,13 @@ def extract_requisites(repo: Repository, doc_id: int) -> RequisitesOutcome:
     values = {name: f.value for name, f in result.fields.items()}
     if auto:
         protocol = auto[0]
+        # Поле перезаписывается, только если оно пусто или всё ещё равно значению, которое
+        # программа извлекла в прошлый раз. Значение, изменённое вручную, сохраняется.
+        previous = {fld: val for fld, val, _e, _r in repo.get_evidence(protocol.id)}
         for name in FIELD_LABELS:
-            setattr(protocol, name, values.get(name))
+            current = getattr(protocol, name)
+            if current is None or current == previous.get(name):
+                setattr(protocol, name, values.get(name))
         protocol = repo.update_protocol(protocol)
         status = "updated"
     else:

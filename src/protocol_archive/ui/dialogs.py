@@ -86,12 +86,18 @@ class ProtocolDialog(QDialog):
         layout.addLayout(form)
         if evidence:
             from ..parsing import FIELD_LABELS
+
+            def shown(field, value):
+                if field == "offender_type":
+                    return OFFENDER_TYPE_LABELS.get(value, value)
+                if field in ("protocol_date", "violation_date"):
+                    return to_display(value)  # ДД.ММ.ГГГГ, как в таблице
+                return value
             box = QPlainTextEdit()
             box.setReadOnly(True)
             box.setFixedHeight(130)
             box.setPlainText("\n".join(
-                f"{FIELD_LABELS.get(f, f)}: {OFFENDER_TYPE_LABELS.get(v, v) if f == 'offender_type' else v}"
-                f"\n    ← «{ev}» [{rule}]"
+                f"{FIELD_LABELS.get(f, f)}: {shown(f, v)}\n    источник: «{ev}» [{rule}]"
                 for f, v, ev, rule in evidence))
             hint = QLabel("Автоматически извлечено из текста документа. Сверьте с оригиналом, "
                           "затем поставьте статус «Проверен».")

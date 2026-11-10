@@ -84,6 +84,52 @@ def test_open_another_database(window, tmp_path):
     assert window.db_path == other and other.exists()
 
 
+def test_protocol_columns_sort_by_values_and_keep_order(window, tmp_path):
+    from PySide6.QtCore import Qt
+
+    f = tmp_path / "sort.pdf"
+    f.write_bytes(b"x")
+    window.add_documents([str(f)])
+    doc = window.repo.list_documents()[0]
+    for number, protocol_date, violation_date, location in [
+        ("А-2", "2025-03-01", "2025-02-10", "ул. Тестовая д. 10"),
+        ("А-10", "2025-01-15", "2025-02-09", "ул. Тестовая д. 2"),
+        ("А-1", None, None, ""),
+    ]:
+        window.repo.add_protocol(Protocol(document_id=doc.id, protocol_number=number,
+                                          protocol_date=protocol_date,
+                                          violation_date=violation_date, location=location))
+    window.refresh_all()
+    t = window.protocol_table
+    header = t.horizontalHeader()
+
+    def column(name):
+        return window.PROTOCOL_COLUMNS.index(name)
+
+    def texts(name):
+        c = column(name)
+        return [t.item(r, c).text() for r in range(t.rowCount())]
+
+    # По умолчанию — дата протокола по убыванию, как раньше.
+    assert texts("Дата протокола") == ["01.03.2025", "15.01.2025", ""]
+
+    # Даты сравниваются как даты, а не как строки «ДД.ММ.ГГГГ».
+    header.setSortIndicator(column("Дата протокола"), Qt.AscendingOrder)
+    assert texts("Дата протокола") == ["", "15.01.2025", "01.03.2025"]
+    header.setSortIndicator(column("Дата нарушения"), Qt.DescendingOrder)
+    assert texts("Дата нарушения") == ["10.02.2025", "09.02.2025", ""]
+
+    # Числа в тексте сортируются как числа: А-2 раньше А-10.
+    header.setSortIndicator(column("№ протокола"), Qt.AscendingOrder)
+    assert texts("№ протокола") == ["А-1", "А-2", "А-10"]
+
+    # Выбранная сортировка сохраняется после поиска/обновления таблицы.
+    window.refresh_protocols()
+    assert texts("№ протокола") == ["А-1", "А-2", "А-10"]
+    assert header.sortIndicatorSection() == column("№ протокола")
+    assert header.sortIndicatorOrder() == Qt.AscendingOrder
+
+
 def test_no_vehicle_plate_in_ui(window):
     headers = [window.protocol_table.horizontalHeaderItem(i).text()
                for i in range(window.protocol_table.columnCount())]
@@ -340,3 +386,41 @@ def test_wrapped_pdf_through_the_window_shows_violation_date(window, qapp, tmp_p
     col = window.PROTOCOL_COLUMNS.index("Дата нарушения")
     assert t.item(0, col).text() == "05.02.2026"      # только дата, без фразы
     assert "не найдено" not in quiet[-1] or "Дата нарушения" not in quiet[-1]
+
+
+def test_delete_all_buttons_clear_tables_and_keep_files(window, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    answers = iter([QMessageBox.No, QMessageBox.Yes, QMessageBox.Yes])
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: next(answers))
+    f = tmp_path / "stay.pdf"
+    f.write_bytes(b"stay")
+    window.add_documents([str(f)])
+    doc = window.repo.list_documents()[0]
+    window.repo.add_protocol(Protocol(document_id=doc.id, protocol_number="УД-1"))
+    window.refresh_all()
+    assert window.protocol_table.rowCount() == 1
+
+    window.delete_all_protocols()                 # отказ — ничего не удаляется
+    assert window.repo.count_protocols() == 1
+
+    window.delete_all_protocols()
+    assert window.repo.count_protocols() == 0
+    assert window.protocol_table.rowCount() == 0
+    assert window.repo.count_documents() == 1
+
+    window.delete_all_documents()
+    assert window.repo.count_documents() == 0
+    assert window.document_table.rowCount() == 0
+    assert f.read_bytes() == b"stay"
+
+
+def test_delete_all_on_empty_base_does_nothing(window, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+
+    monkeypatch.setattr(QMessageBox, "question", lambda *a, **k: (_ for _ in ()).throw(AssertionError("вопрос не нужен")))
+    notes = []
+    monkeypatch.setattr(QMessageBox, "information", lambda *a, **k: notes.append(a[2]))
+    window.delete_all_protocols()
+    window.delete_all_documents()
+    assert notes == ["В базе нет протоколов.", "В базе нет документов."]

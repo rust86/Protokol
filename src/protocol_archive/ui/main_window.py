@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Iterable, List, Optional
 
@@ -50,9 +51,34 @@ def _fit_table(table: QTableWidget) -> None:
     table.resizeRowsToContents()
 
 
-def _item(text: str, data=None) -> QTableWidgetItem:
-    it = QTableWidgetItem(text or "")
-    it.setFlags(it.flags() & ~Qt.ItemIsEditable)
+_NATURAL_PARTS = re.compile(r"(\d+)")
+
+
+def _natural_key(value: str):
+    """Ключ сортировки: без учёта регистра, числа — как числа («А-2» раньше «А-10»)."""
+    key = []
+    for part in _NATURAL_PARTS.split(value or ""):
+        if part:
+            key.append((0, int(part)) if part.isdigit() else (1, part.casefold()))
+    return tuple(key)
+
+
+class _TableItem(QTableWidgetItem):
+    """Ячейка с отдельным ключом сортировки (показ может быть «ДД.ММ.ГГГГ», ключ — ISO)."""
+
+    def __init__(self, text: str, sort_value: Optional[str] = None):
+        super().__init__(text or "")
+        self._sort_key = _natural_key(text if sort_value is None else sort_value)
+        self.setFlags(self.flags() & ~Qt.ItemIsEditable)
+
+    def __lt__(self, other) -> bool:
+        if isinstance(other, _TableItem):
+            return self._sort_key < other._sort_key
+        return super().__lt__(other)
+
+
+def _item(text: str, data=None, sort_value: Optional[str] = None) -> QTableWidgetItem:
+    it = _TableItem(text, sort_value)
     if data is not None:
         it.setData(Qt.UserRole, data)
     return it
@@ -193,6 +219,11 @@ class MainWindow(QMainWindow):
         lay = QVBoxLayout(w)
         lay.addWidget(self._build_search_box())
         self.protocol_table = self._make_table(self.PROTOCOL_COLUMNS)
+        header = self.protocol_table.horizontalHeader()
+        header.setSortIndicatorShown(True)
+        # Как и раньше, по умолчанию — свежие протоколы сверху.
+        header.setSortIndicator(self.PROTOCOL_COLUMNS.index("Дата протокола"), Qt.DescendingOrder)
+        self.protocol_table.setSortingEnabled(True)
         self.protocol_table.doubleClicked.connect(lambda _i: self.edit_protocol())
         lay.addWidget(self.protocol_table)
         row = QHBoxLayout()
@@ -200,6 +231,7 @@ class MainWindow(QMainWindow):
             ("Добавить протокол вручную…", self.add_protocol),
             ("Изменить…", self.edit_protocol),
             ("Удалить запись", self.delete_protocol),
+            ("Удалить все протоколы", self.delete_all_protocols),
             ("Открыть оригинал", self.open_protocol_original),
         ):
             b = QPushButton(text)
@@ -237,6 +269,7 @@ class MainWindow(QMainWindow):
             ("Извлечь реквизиты", self.extract_selected_requisites),
             ("Извлечь реквизиты у всех обработанных", self.extract_pending_requisites),
             ("Удалить из базы", self.delete_document),
+            ("Удалить все документы", self.delete_all_documents),
             ("Проверить наличие файлов", self.check_missing),
             ("Открыть оригинал", self.open_document_original),
         ):
@@ -245,8 +278,8 @@ class MainWindow(QMainWindow):
             row.addWidget(b)
         row.addStretch(1)
         lay.addLayout(row)
-        hint = QLabel("«Удалить из базы» удаляет только запись и связанные протоколы; "
-                      "файл-оригинал не затрагивается.")
+        hint = QLabel("«Удалить из базы» и «Удалить все документы» удаляют только записи "
+                      "и связанные протоколы; файлы-оригиналы не затрагиваются.")
         hint.setWordWrap(True)
         lay.addWidget(hint)
         return w
@@ -277,17 +310,31 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Поиск", str(exc))
             return
         t = self.protocol_table
+        # Пока заполняем таблицу, сортировка выключена, иначе Qt переставляет строки на каждом
+        # setItem. Включение в конце применяет колонку и направление, выбранные пользователем.
+        t.setSortingEnabled(False)
         t.setRowCount(len(rows))
         for i, r in enumerate(rows):
             p = r.protocol
-            values = [p.protocol_number, to_display(p.protocol_date),
-                      to_display(p.violation_date), p.article,
-                      OFFENDER_TYPE_LABELS.get(p.offender_type or "", ""), p.offender_name,
-                      p.location, p.gost_norms, STATUS_LABELS.get(p.status, p.status),
-                      r.document_name]
-            for c, v in enumerate(values):
-                t.setItem(i, c, _item(v or "", p.id if c == 0 else None))
+            # Пара «что показываем» / «по чему сортируем». Даты сортируются по ISO-значению,
+            # а не по тексту «ДД.ММ.ГГГГ».
+            cells = [
+                (p.protocol_number, p.protocol_number),
+                (to_display(p.protocol_date), p.protocol_date),
+                (to_display(p.violation_date), p.violation_date),
+                (p.article, p.article),
+                (OFFENDER_TYPE_LABELS.get(p.offender_type or "", ""),
+                 OFFENDER_TYPE_LABELS.get(p.offender_type or "", "")),
+                (p.offender_name, p.offender_name),
+                (p.location, p.location),
+                (p.gost_norms, p.gost_norms),
+                (STATUS_LABELS.get(p.status, p.status), STATUS_LABELS.get(p.status, p.status)),
+                (r.document_name, r.document_name),
+            ]
+            for c, (text, sort_value) in enumerate(cells):
+                t.setItem(i, c, _item(text or "", p.id if c == 0 else None, sort_value or ""))
             t.item(i, 0).setData(Qt.UserRole + 1, r.document_path)
+        t.setSortingEnabled(True)  # включает сортировку по сохранённой колонке и направлению
         _fit_table(t)
         self._update_status()
 
@@ -522,6 +569,21 @@ class MainWindow(QMainWindow):
             self.repo.delete_document(doc_id)
             self.refresh_all()
 
+    def delete_all_documents(self) -> None:
+        n = self.repo.count_documents()
+        if n == 0:
+            QMessageBox.information(self, "Документы", "В базе нет документов.")
+            return
+        protocols = self.repo.count_protocols()
+        extra = f"\nВместе с ними будут удалены протоколы: {protocols}." if protocols else ""
+        ok = QMessageBox.question(
+            self, "Удалить все документы",
+            f"Удалить из базы все документы ({n})?{extra}\n"
+            "Файлы-оригиналы останутся на месте. Это нельзя отменить.")
+        if ok == QMessageBox.Yes:
+            self.repo.delete_all_documents()
+            self.refresh_all()
+
     def check_missing(self) -> None:
         n = self.repo.check_missing_documents()
         self.refresh_documents()
@@ -578,6 +640,19 @@ class MainWindow(QMainWindow):
                                 "Удалить запись о протоколе из базы?\n"
                                 "Документ-оригинал не затрагивается.") == QMessageBox.Yes:
             self.repo.delete_protocol(pid)
+            self.refresh_all()
+
+    def delete_all_protocols(self) -> None:
+        n = self.repo.count_protocols()
+        if n == 0:
+            QMessageBox.information(self, "Протоколы", "В базе нет протоколов.")
+            return
+        if QMessageBox.question(
+                self, "Удалить все протоколы",
+                f"Удалить из базы все протоколы ({n})?\n"
+                "Документы и файлы-оригиналы не затрагиваются. Это нельзя отменить."
+                ) == QMessageBox.Yes:
+            self.repo.delete_all_protocols()
             self.refresh_all()
 
     def open_protocol_original(self) -> None:

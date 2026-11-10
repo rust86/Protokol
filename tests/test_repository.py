@@ -166,6 +166,29 @@ def test_delete_protocol_keeps_document(repo, doc):
     assert repo.get_document(doc.id) is not None
 
 
+def test_delete_all_protocols_keeps_documents(repo, make_file):
+    d1 = repo.add_document(make_file("a.pdf", b"a"))
+    d2 = repo.add_document(make_file("b.pdf", b"b"))
+    p = repo.add_protocol(Protocol(document_id=d1.id, protocol_number="А-1"))
+    repo.set_evidence(p.id, [("protocol_number", "А-1", "А-1", "test")])
+    repo.add_protocol(Protocol(document_id=d2.id, protocol_number="А-2"))
+    assert repo.delete_all_protocols() == 2
+    assert repo.count_protocols() == 0
+    assert repo.count_documents() == 2
+    assert repo.get_evidence(p.id) == []
+    assert repo.delete_all_protocols() == 0
+
+
+def test_delete_all_documents_removes_protocols_and_keeps_files(repo, make_file):
+    path = make_file("keep.pdf", b"original")
+    doc = repo.add_document(path)
+    repo.add_protocol(Protocol(document_id=doc.id, protocol_number="Б-1"))
+    assert repo.delete_all_documents() == 1
+    assert repo.count_documents() == 0
+    assert repo.count_protocols() == 0
+    assert path.read_bytes() == b"original"
+
+
 # ----- поиск ----------------------------------------------------------------
 
 @pytest.fixture

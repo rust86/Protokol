@@ -58,7 +58,7 @@ def test_violation_date_is_the_action_date_not_other_dates():
 def test_location_comes_only_from_the_block_after_expressed():
     r = parsed()
     assert r.value("location") == "ул. Тестовой д. 8"           # только адрес, без описания
-    assert "Индустриальная" not in r.value("location")         # адреса лица/составления не берутся
+    assert "Тестовая, 1" not in r.value("location")         # адреса лица/составления не берутся
     assert "ул. Тестовая д. 2" not in r.value("location")
 
 
@@ -68,6 +68,22 @@ def test_violation_date_variants_and_failures():
     bad = parse_protocol(base.format("31.02.2026"))
     assert bad.value("violation_date") is None and "несуществующая" in bad.missing["violation_date"]
     assert "violation_date" in parse_protocol("ПРОТОКОЛ 86 НН 000001\nвыявлено 05.02.2026\n").missing
+
+
+def test_violation_date_before_interval_with_period_phrase():
+    """«…фиксация осуществлялась 19.01.2026 в период времени с 13 ч. 20 мин. по 13 ч. 30 мин.»"""
+    r = parse_protocol(
+        "ПРОТОКОЛ 86 НН 000001\n"
+        "первичная фиксация осуществлялась 19.01.2026 в период времени "
+        "с 13 ч. 20 мин. по 13 ч. 30 мин.\n")
+    assert r.value("violation_date") == "2026-01-19"
+
+
+def test_decision_date_with_interval_is_not_violation_date():
+    r = parse_protocol(
+        "ПРОТОКОЛ 86 НН 000001\n"
+        "решение от 19.01.2026 в период времени с 13 ч. 20 мин. по 13 ч. 30 мин.\n")
+    assert r.value("violation_date") is None
 
 
 def test_location_needs_a_clear_end_of_block():
@@ -87,27 +103,27 @@ def test_parsing_is_deterministic():
 # ----- реальная шапка протокола (структура из ODT пользователя) ------------------------------
 
 def test_real_world_header_layout():
-    text = ("ПРОТОКОЛ 86 НН 122990\nоб административном правонарушении\n"
+    text = ("ПРОТОКОЛ 86 НН 000001\nоб административном правонарушении\n"
             "в отношении юридического лица\n\n"
-            "06 февраля 2026 г. 15 ч. 30 мин.\tг. Нижневартовск, ул. Индустриальная, 68\n\n"
-            "Начальник отделения\nпо г. Нижневартовску, майор полиции Аюпов Р. И.\n\n"
+            "06 февраля 2026 г. 15 ч. 30 мин.\tг. Тестоград, ул. Тестовая, 1\n\n"
+            "Начальник отделения\nпо г. Тестограду, майор полиции Тестов Т. Т.\n\n"
             "в присутствии защитника\n\n"
             "составил настоящий протокол за нарушение, предусмотренное ч. 1 ст. 12.34 КоАП РФ в отношении:\n"
-            'МБУ "Управление по дорожному хозяйству и благоустройству г. Нижневартовска"\n'
-            "расположенного по адресу: г. Нижневартовск\nОГРН 1178617005489 от 30.03.2017, ИНН 8603227648\n")
+            'МБУ "Тестовое управление по дорожному хозяйству"\n'
+            "расположенного по адресу: г. Тестоград\nОГРН 0000000000000 от 01.01.2000, ИНН 0000000000\n")
     r = parse_protocol(text)
-    assert r.value("protocol_number") == "86 НН 122990"
-    assert r.value("offender_name").startswith('МБУ "Управление по дорожному хозяйству')
-    assert r.value("authority").endswith("Аюпов Р. И.")
+    assert r.value("protocol_number") == "86 НН 000001"
+    assert r.value("offender_name").startswith('МБУ "Тестовое управление')
+    assert r.value("authority").endswith("Тестов Т. Т.")
 
 
 # ----- номер ---------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("header,expected", [
-    ("ПРОТОКОЛ 86 НН 122990", "86 НН 122990"),
-    ("Протокол 86нн105320", "86 НН 105320"),          # слитно и в нижнем регистре
-    ("ПРОТОКОЛ № 86  НН  122990", "86 НН 122990"),
-    ("ПРОТОКОЛ 86 HH 122990", "86 НН 122990"),         # латинские H на скане
+    ("ПРОТОКОЛ 86 НН 000001", "86 НН 000001"),
+    ("Протокол 86нн000002", "86 НН 000002"),          # слитно и в нижнем регистре
+    ("ПРОТОКОЛ № 86  НН  000001", "86 НН 000001"),
+    ("ПРОТОКОЛ 86 HH 000001", "86 НН 000001"),         # латинские H на скане
 ])
 def test_number_variants(header, expected):
     r = parse_protocol(header + "\nоб административном правонарушении\n")
@@ -115,7 +131,7 @@ def test_number_variants(header, expected):
 
 
 def test_latin_letters_in_series_produce_a_warning():
-    r = parse_protocol("ПРОТОКОЛ 86 HH 122990\n")
+    r = parse_protocol("ПРОТОКОЛ 86 HH 000001\n")
     assert any("латинские" in w for w in r.warnings)
 
 
@@ -226,10 +242,10 @@ def test_location_after_expressed_variants_without_colon():
 
 
 def test_location_intersections_are_reported_not_entered():
-    r = loc("по ул. Мира д. 95, пересечении улиц Мира — Салманова, Северная – Индустриальная;")
+    r = loc("по ул. Мира д. 95, пересечении улиц Тестовая — Образцовая, Северная – Центральная;")
     assert r.value("location") == "ул. Мира д. 95"
-    assert any("Мира — Салманова" in w for w in r.warnings)
-    only = loc("на пересечении улиц Мира — Салманова.")
+    assert any("Тестовая — Образцовая" in w for w in r.warnings)
+    only = loc("на пересечении улиц Тестовая — Образцовая.")
     assert only.value("location") is None and "нет адресов" in only.missing["location"]
     assert any("пересечения" in w or "пересечении" in w for w in only.warnings)
 
@@ -381,16 +397,16 @@ def test_violation_date_evidence_is_the_interval_phrase():
     assert r.fields["violation_date"].evidence == "06.07.2026 с 14:10 по 14:14"
 
 
-@pytest.mark.parametrize("header", ["ПРОТОКОЛ 86 Н Н 105317", "ПРОТОКОЛ 86 НН 105317", "ПРОТОКОЛ 86 H H 105317",
-                                    "Протокол 86нн105317"])
+@pytest.mark.parametrize("header", ["ПРОТОКОЛ 86 Н Н 000003", "ПРОТОКОЛ 86 НН 000003", "ПРОТОКОЛ 86 H H 000003",
+                                    "Протокол 86нн000003"])
 def test_number_with_spaces_between_series_letters(header):
-    assert parse_protocol(header + "\n").value("protocol_number") == "86 НН 105317"
+    assert parse_protocol(header + "\n").value("protocol_number") == "86 НН 000003"
 
 
 @pytest.mark.parametrize("body,expected", [
     # улица + дом, полное написание, «по адресу г. …»
     ("выразившееся в проведении дорожных работ по демонтажу сборно-разборной искусственной неровности "
-     "по адресу г. Нижневартовск ул. Мира д. 95 в нарушение\nПо итогам", "ул. Мира д. 95"),
+     "по адресу г. Тестоград ул. Мира д. 95 в нарушение\nПо итогам", "ул. Мира д. 95"),
     # «в районе дома 45 по улице Лопарева» → дом перед улицей
     ("выразившееся в наличии дефекта обочины на 14,5 см, в районе дома 45 по улице Лопарева.\nПо итогам",
      "ул. Лопарева д. 45"),
@@ -470,8 +486,8 @@ def test_descriptive_place_sample_extracts_everything():
 
 
 def test_descriptive_place_keeps_decimals_and_abbreviations_inside():
-    r = loc("выразившееся в отсутствии разметки 1.2, 1.5 на подъездной дороге к СНТ «Мега-84» г. Тестограда.")
-    assert r.value("location") == "на подъездной дороге к СНТ «Мега-84» г. Тестограда"
+    r = loc("выразившееся в отсутствии разметки 1.2, 1.5 на подъездной дороге к СНТ «Тест-1» г. Тестограда.")
+    assert r.value("location") == "на подъездной дороге к СНТ «Тест-1» г. Тестограда"
 
 
 @pytest.mark.parametrize("block,expected", [
@@ -492,7 +508,7 @@ def test_street_address_wins_over_descriptive_place():
 def test_descriptive_place_is_not_invented_from_unrelated_words():
     assert loc("выразившееся в наличии дефекта размером 14,5 см.").value("location") is None
     assert loc("выразившееся в нарушении по демонтажу неровности.").value("location") is None
-    assert loc("выразившееся в яме на пересечении улиц Мира — Салманова.").value("location") is None
+    assert loc("выразившееся в яме на пересечении улиц Тестовая — Образцовая.").value("location") is None
 
 
 def test_gost_list_follows_document_order():
@@ -579,3 +595,74 @@ def test_streets_without_house_are_reported_only_when_an_address_exists():
     assert r.value("location") == "ул. Мира д. 60/5"
     assert any("ул. Дзержинского" in w for w in r.warnings)
     assert not any("ул. Мира" in w for w in r.warnings)                     # улица с домом — не «без номера»
+
+
+def test_street_spans_without_house_are_entered():
+    """Участки «проезжей части ул. А (от ул. Б до ул. В)» — место без номеров домов."""
+    block = ("в наличии зимней скользкости на покрытии проезжей части ул. Дзержинского "
+             "(от ул. Северной до ул. Интернациональной), ул. Зимняя "
+             "(от ул. Интернациональной до ул. Северной), момент обнаружения 28.01.2026")
+    r = loc(block)
+    assert r.value("location") == ("ул. Дзержинского; ул. Зимняя; ул. Северной; ул. Интернациональной")
+    assert r.fields["location"].rule == "location.street_spans"
+    assert any("без номеров домов" in w for w in r.warnings)
+
+
+def test_street_list_in_coverage_without_od_do_is_entered():
+    """Перечисление улиц без домов, где границы участка даны в скобках без «от … до …»."""
+    block = ("в наличии зимней скользкости на покрытии проезжей части ул. Индустриальной "
+             "(Авиаторов - Интернациональная), ул. Мира (на всем протяжении), "
+             "ул. Интернациональной (на всем протяжении) г. Тестограда.")
+    r = loc(block)
+    assert r.value("location") == "ул. Индустриальной; ул. Мира; ул. Интернациональной"
+    assert r.fields["location"].rule == "location.street_spans"
+    assert any("без номеров домов" in w for w in r.warnings)
+
+
+def test_descriptive_place_road_abbreviation_with_km():
+    """«а/д … в районе км 8+357 км» — место без улицы и номера дома."""
+    block = ("в наличии на покрытии проезжей части а/д Тестоград - Образцовый "
+             "в районе км 8+357 км, зимней скользкости в виде снежного наката.")
+    r = loc(block)
+    assert r.value("location") == "а/д Тестоград - Образцовый в районе км 8+357 км"
+    assert r.fields["location"].rule == "location.descriptive_place"
+
+
+def test_bare_street_is_still_not_invented():
+    assert loc("по ул. Мира и по ул. Ленина.").value("location") is None
+
+
+def test_address_from_circumstances_when_expressed_is_absent():
+    """ДТП: нет «выразившееся», адрес с домом лежит в описании обстоятельств, не в шапке."""
+    text = (
+        "ПРОТОКОЛ 86 НН 122869\n"
+        "31 марта 2026 г. 15 ч. 30 мин. г. Тестоград, ул. Индустриальная, 68\n"
+        "расположенного по адресу: г. Тестоград, ул. Индустриальная д. 70\n"
+        "ОБСТОЯТЕЛЬСТВА ПРАВОНАРУШЕНИЯ:\n"
+        "10.03.2026 около 11 ч. 15 мин. на ул. Мира д.12Б водитель допустил столкновение.\n"
+        "Изучив материалы, прихожу к следующему.\n"
+        "В соответствии с п. 5.2.3 ГОСТ Р 52289-2019 знак устанавливают.\n"
+    )
+    r = parse_protocol(text)
+    assert r.value("location") == "ул. Мира д. 12Б"
+    assert r.fields["location"].rule == "location.address_in_circumstances"
+    assert r.value("gost_norms") is None          # «в соответствии с» — не нарушенный пункт
+
+
+def test_ocr_splits_do_not_drop_violated_gost():
+    """Скан: запятая перед ГОСТ, «и.» вместо «п.», черта и перенос года."""
+    text = (
+        "ПРОТОКОЛ 86 НН 105322\n"
+        "а именно нарушены требования ст. 12 Федерального закона, п. 13 ОПД ПДД РФ, п. 6.3.1,\n"
+        "ГОСТ 50597-2017, выразившиеся\n"
+        "в отсутствии разметки по ул. Кузоваткина д.3, в нарушение и. 6.5 |\n"
+        "ГОСТ 52289-2019;\n"
+        "в отсутствии ограждений, в нарушении п. 8.1.6 ГОСТ 52289-\n"
+        "2019.\n"
+        "\n"
+        "Создается угроза.\n"
+        "В соответствии с п. 6.3.1 ГОСТ 50597-2017, дороги должны иметь разметку.\n"
+    )
+    r = parse_protocol(text)
+    assert r.value("gost_norms") == (
+        "п. 6.3.1 ГОСТ 50597-2017; п. 6.5 ГОСТ 52289-2019; п. 8.1.6 ГОСТ 52289-2019")

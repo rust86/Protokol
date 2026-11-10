@@ -233,6 +233,13 @@ class Repository:
         with self.conn:
             self.conn.execute("DELETE FROM documents WHERE id=?", (doc_id,))
 
+    def delete_all_documents(self) -> int:
+        """Удаляет все документы, их тексты и протоколы. Файлы-оригиналы не затрагиваются."""
+        with self.conn:
+            n = self.conn.execute("SELECT COUNT(*) FROM documents").fetchone()[0]
+            self.conn.execute("DELETE FROM documents")
+        return n
+
     def check_missing_documents(self) -> int:
         """Помечает статусом 'missing' документы, чьи файлы больше не существуют."""
         count = 0
@@ -374,6 +381,13 @@ class Repository:
     def delete_protocol(self, protocol_id: int) -> None:
         with self.conn:
             self.conn.execute("DELETE FROM protocols WHERE id=?", (protocol_id,))
+
+    def delete_all_protocols(self) -> int:
+        """Удаляет все записи протоколов и сведения об извлечении. Документы остаются."""
+        with self.conn:
+            n = self.conn.execute("SELECT COUNT(*) FROM protocols").fetchone()[0]
+            self.conn.execute("DELETE FROM protocols")
+        return n
 
     def count_protocols(self) -> int:
         return self.conn.execute("SELECT COUNT(*) FROM protocols").fetchone()[0]

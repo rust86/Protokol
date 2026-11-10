@@ -7,9 +7,11 @@
 * значения не «исправляются»: если в документе дата несуществующая — поля не будет.
 
 Дата нарушения принимается равной дате контрольных действий; место нарушения — адреса вида
-«ул. Мира д. 95» из блока после слова «выразившиеся/выразившееся»; нарушенные пункты ГОСТ — из
-фраз «в нарушение п. N ГОСТ …» и «нарушены требования … п. N ГОСТ … выразившиеся» (решения
-пользователя).
+«ул. Мира д. 95» из блока после слова «выразившиеся/выразившееся», а если их нет — словесное
+описание, участки улиц без дома («проезжей части ул. … от ул. … до ул. …») или адрес с номером
+дома из описания обстоятельств; нарушенные пункты ГОСТ — из фраз «в нарушение п. N ГОСТ …» и
+«нарушены требования … п. N ГОСТ … выразившиеся» (решения пользователя). Пояснительные ссылки
+«в соответствии с п. N ГОСТ …» нарушенными не считаются.
 
 Правила написаны по форме протокола «в отношении юридического лица» (ГИБДД,
 ст. 12.34 КоАП РФ). Для других форм (в том числе «в отношении должностного лица»)
@@ -220,10 +222,12 @@ _DATE_NUM = r"(?P<d>\d{2})\.(?P<m>\d{2})\.(?P<y>\d{4})"
 _INTERVAL = r"с\s+" + _TIME + r"\s+(?:по|до)\s+" + _TIME
 # «…по 10 ч. 45 мин. 04.05.2026» — дата сразу после интервала
 _ACTION_AFTER = re.compile(r"(?<!\w)" + _INTERVAL + r"\s*,?\s*" + _DATE_NUM, _FLAGS)
-# «…проведённого 06.07.2026 с 14:10 по 14:14» — дата сразу перед интервалом
-_ACTION_BEFORE = re.compile(r"(?<![\d.])" + _DATE_NUM + r"\s*,?\s*" + _INTERVAL, _FLAGS)
+# «…проведённого 06.07.2026 с 14:10 по 14:14», «…фиксация осуществлялась 19.01.2026
+# в период времени с 13 ч. 20 мин. по 13 ч. 30 мин.» — дата перед интервалом
+_ACTION_BEFORE = re.compile(
+    r"(?<![\d.])" + _DATE_NUM + r"\s*,?\s*(?:в\s+период\s+времени\s+)?" + _INTERVAL, _FLAGS)
 # слова, говорящие, что речь о контрольных действиях (а не, например, о дате решения)
-_ACTION_CONTEXT = re.compile(r"провед|период|осмотр|обследован|рейд|мероприят|контрольн", _FLAGS)
+_ACTION_CONTEXT = re.compile(r"провед|фиксац|период|осмотр|обследован|рейд|мероприят|контрольн", _FLAGS)
 
 
 def _find_violation_date(text: str, start: int, res: ParseResult) -> None:
@@ -234,6 +238,7 @@ def _find_violation_date(text: str, start: int, res: ParseResult) -> None:
     * «проведённых с 11 ч. 34 мин. по 16 ч. 10 мин. 05.02.2026»  (дата после интервала)
     * «В период времени с 10 ч. 44 мин. по 10 ч. 45 мин. 04.05.2026»
     * «проведённого 06.07.2026 с 14:10 по 14:14»                    (дата перед интервалом)
+    * «фиксация осуществлялась 19.01.2026 в период времени с 13 ч. 20 мин. по 13 ч. 30 мин.»
     """
     found = []
     for pattern in (_ACTION_AFTER, _ACTION_BEFORE):
@@ -380,10 +385,19 @@ def _sentence_end(s: str, start: int) -> int:
     return len(s)
 
 
+# «а/д Тестоград - Образцовый в районе км 8+357 км» — дорога без названия улицы.
+# Конец описания — запятая, точка или конец блока; дальнейший текст относится к нарушению.
+_ROAD_ABBR = re.compile(r"(?<!\w)а\s*/\s*д\.?\s+[^\n,;.]+?(?=\s*(?:,|\.|$))", _FLAGS)
+
+
 def _descriptive_place(block: str) -> Optional[str]:
-    """Место, описанное словами: «на подъездной дороге к СНТ «Мега-84» г. Нижневартовска».
-    Берётся от предлога перед названием дороги/участка/территории до конца предложения.
-    Пересечения улиц сюда не относятся."""
+    """Место, описанное словами: «на подъездной дороге к СНТ «Тест-1» г. Тестограда»,
+    «на покрытии проезжей части а/д Тестоград - Образцовый в районе км 8+357 км».
+    Берётся от предлога перед названием дороги/участка/территории до конца предложения;
+    для «а/д» — до запятой, точки или конца блока. Пересечения улиц сюда не относятся."""
+    road = _ROAD_ABBR.search(block)
+    if road:
+        return re.sub(r"\s+", " ", road.group(0)).strip(" ,") or None
     m = _PLACE_START.search(block)
     if not m:
         return None
@@ -432,12 +446,94 @@ def _violation_block(text: str, start: int):
     return m, block, True, ""
 
 
+# «на покрытии проезжей части ул. Дзержинского (от ул. Северной до ул. Интернациональной)»
+# Точка внутри «ул.» границей не считается.
+_COVERAGE = re.compile(
+    r"(?:на\s+покрытии\s+)?проезж\w+\s+част\w+\s+"
+    r"(?P<body>(?:(?!\bул\.)[.,]|[^.,])+)",
+    _FLAGS)
+# «(от ул. Северной до ул. Интернациональной)» — границы участка, не отдельные улицы-нарушения,
+# но сами названия нужны в поле, потому что номер дома не указан.
+_SPAN_BOUNDS = re.compile(
+    r"\(\s*от\s+(?P<a>(?:ул|пр-кт|пер|проезд|б-р|ш|наб)\.\s*[^)]+?)\s+"
+    r"до\s+(?P<b>(?:ул|пр-кт|пер|проезд|б-р|ш|наб)\.\s*[^)]+?)\s*\)",
+    _FLAGS)
+
+
+def _street_label(raw: str) -> Optional[str]:
+    m = _STREET_ONLY.search(raw.strip())
+    if not m:
+        return None
+    name = re.sub(r"\s+", " ", m.group("name")).strip(" ,.;")
+    if not name:
+        return None
+    return f"{_canonical_street_type(m.group('type'))} {name}"
+
+
+def _street_spans(block: str) -> List[str]:
+    """Улицы без номера дома внутри фразы про покрытие/проезжую часть.
+
+    Понимаются участки «ул. А (от ул. Б до ул. В), ул. Г (от …)» и перечисления
+    «ул. А (Авиаторов - Интернациональная), ул. Б (на всём протяжении)».
+    Одинокая «ул. Мира» без такой фразы сюда не попадает. Названия внутри скобок
+    не склеиваются друг с другом («ул. Северной до ул»).
+    """
+    found: List[str] = []
+
+    def add(item: Optional[str]) -> None:
+        if item and item not in found:
+            found.append(item)
+
+    for m in _COVERAGE.finditer(block):
+        body = m.group("body")
+        masked = _SPAN_BOUNDS.sub(" ", body)
+        _, streets = _scan_addresses(masked)
+        for item in streets:
+            add(item)
+        for b in _SPAN_BOUNDS.finditer(body):
+            add(_street_label(b.group("a")))
+            add(_street_label(b.group("b")))
+    return found
+
+
+def _circumstance_addresses(text: str, start: int):
+    """Адреса с номером дома из описания обстоятельств, если блока «выразившиеся» нет.
+
+    Шапка протокола («г. …, ул. …, 68» без «д.») и адрес юридического лица
+    («расположенного по адресу») не берутся: ищется только «ул. … д. N».
+    """
+    head = re.search(r"ОБСТОЯТЕЛЬСТВА\s+ПРАВОНАРУШЕНИЯ", text[start:], _FLAGS)
+    region = text[start + head.start():] if head else text[start:]
+    # Конец описания факта, а не цитата нормы внутри абзаца («в соответствии со ст. …» может
+    # стоять в середине предложения). Берём несколько абзацев до «Изучив…» или до отдельного
+    # абзаца, который начинает правовое обоснование.
+    stop = re.search(
+        r"\n\s*(?:Изучив\b|В\s+соответствии\s+со?\s+ст\b|Распоряжением\b|Пунктом\s+\d)",
+        region, _FLAGS)
+    if stop:
+        region = region[:stop.start()]
+    addresses, _ = _scan_addresses(region)
+    return addresses, region
+
+
 def _find_location(text: str, start: int, res: ParseResult) -> None:
     """Место нарушения: адреса «ул. Название д. N» из блока после «выразившиеся/выразившееся».
-    Если адресов нет, берётся место, описанное словами («на подъездной дороге к СНТ …»).
-    Улицы без номера дома и пересечения улиц в поле не вносятся, о них выдаётся предупреждение."""
-    _, block, closed, reason = _violation_block(text, start)
+    Если адресов нет, берётся место, описанное словами («на подъездной дороге к СНТ …»),
+    либо участки улиц без дома («проезжей части ул. А (от ул. Б до ул. В)»).
+    Если слова «выразившиеся» нет, ищется адрес с номером дома в описании обстоятельств.
+    Пересечения улиц и одинокие улицы без дома в поле не вносятся."""
+    em, block, closed, reason = _violation_block(text, start)
     if not closed:
+        if em is None:
+            addresses, region = _circumstance_addresses(text, start)
+            if addresses:
+                res.warnings.append("Место взято из описания обстоятельств (в тексте нет "
+                                    "«выразившиеся»): проверьте по оригиналу, что это место "
+                                    "нарушения, а не адрес участника.")
+                res.fields["location"] = ExtractedField(
+                    "location", "; ".join(addresses), _squash(region, limit=800),
+                    "location.address_in_circumstances")
+                return
         res.missing["location"] = reason
         return
     skipped = [re.sub(r"\s+", " ", i.group(0)).strip(" .;") for i in _INTERSECTION.finditer(block)]
@@ -450,14 +546,22 @@ def _find_location(text: str, start: int, res: ParseResult) -> None:
                             + "; ".join(streets)[:300])
     if not addresses:
         place = _descriptive_place(block)
-        if place is None:
-            res.missing["location"] = ("в блоке нет адресов вида «ул. Название д. N» и описания места "
-                                       "(«на … дороге», «на участке …», «на территории …»)")
+        if place is not None:
+            res.warnings.append("Место нарушения описано без улицы и номера дома и записано как в тексте: "
+                                f"«{place}». Проверьте по оригиналу.")
+            res.fields["location"] = ExtractedField(
+                "location", _squash(place, limit=300), _squash(block, limit=800), "location.descriptive_place")
             return
-        res.warnings.append("Место нарушения описано без улицы и номера дома и записано как в тексте: "
-                            f"«{place}». Проверьте по оригиналу.")
-        res.fields["location"] = ExtractedField(
-            "location", _squash(place, limit=300), _squash(block, limit=800), "location.descriptive_place")
+        spans = _street_spans(block)
+        if spans:
+            res.warnings.append("Место указано участками улиц без номеров домов и записано списком улиц: "
+                                + "; ".join(spans)[:300] + ". Проверьте границы участков по оригиналу.")
+            res.fields["location"] = ExtractedField(
+                "location", "; ".join(spans), _squash(block, limit=800), "location.street_spans")
+            return
+        res.missing["location"] = ("в блоке нет адресов вида «ул. Название д. N», описания места "
+                                   "(«на … дороге», «на участке …», «на территории …») и участков "
+                                   "улиц («проезжей части ул. … от ул. … до ул. …»)")
         return
     res.fields["location"] = ExtractedField(
         "location", "; ".join(addresses), _squash(block, limit=800), "location.addresses_after_expressed")
@@ -465,11 +569,14 @@ def _find_location(text: str, start: int, res: ParseResult) -> None:
 
 # ----- нарушенные пункты ГОСТ ----------------------------------------------------------------------------
 
-_GOST = r"ГОСТ(?:\s*Р)?\s*\d{4,5}(?:\.\d+)?-\d{2,4}"
+# Год может быть перенесён OCR: «ГОСТ 52289-\n2019», «ГОСТ 52289- |\n2019».
+_GOST = r"ГОСТ(?:\s*Р)?\s*\d{4,5}(?:\.\d+)?-[\s|]*\d{2,4}"
 _POINT = r"\d+(?:\.\d+)*"
 _PTS = _POINT + r"(?:\s*(?:,|;|и)\s*" + _POINT + r")*"
+# «и.» — частая ошибка OCR вместо «п.»; запятая перед ГОСТ («п. 6.3.1, ГОСТ …») тоже от скана.
 _REF = re.compile(
-    r"(?:пп?\.|пункт\w*|подпункт\w*)\s*(?P<pts>" + _PTS + r")\s*(?P<gost>" + _GOST + ")", _FLAGS)
+    r"(?:пп?\.|и\.|пункт\w*|подпункт\w*)\s*(?P<pts>" + _PTS + r")\s*[,|]?\s*(?P<gost>" + _GOST + ")",
+    _FLAGS)
 # продолжение без слова «пункт»: «…ГОСТ Р 58350-2019, 5.9.29, 5.5.5 ГОСТ Р 52289-2019»
 _BARE = re.compile(r"(?P<pts>" + _PTS + r")\s*(?P<gost>" + _GOST + ")", _FLAGS)
 _IN_VIOLATION = re.compile(r"в\s+нарушени\w*\s+(?:(?:требовани\w+|положени\w+)\s+)?", _FLAGS)
@@ -478,7 +585,8 @@ _REQUIREMENTS = re.compile(r"нарушен\w*\s+требовани\w*", _FLAGS)
 
 
 def _normalize_gost(raw: str) -> str:
-    g = re.sub(r"\s+", " ", raw).upper()
+    g = re.sub(r"[\s|]+", " ", raw).strip().upper()
+    g = re.sub(r"-\s+", "-", g)                        # «52289- 2019» после переноса строки
     if re.match(r"^ГОСТ ?Р", g):
         return re.sub(r"^ГОСТ ?Р ?", "ГОСТ Р ", g)      # «ГОСТР 50597-2017» → «ГОСТ Р 50597-2017»
     return re.sub(r"^ГОСТ ?", "ГОСТ ", g)
@@ -511,7 +619,8 @@ def _find_gost(text: str, start: int, res: ParseResult) -> None:
     п. 3.18 ГОСТ…», «согласно п. 8.8 ГОСТ…») не учитываются.
 
     * «в нарушение п. 5.2.4 ГОСТ Р 50597-2017» — ссылки, идущие сразу за фразой (через «,», «;», «и»);
-    * «нарушены требования …, п. 8.1, 8.8 ГОСТ Р 50597-2017, выразившиеся» — до слова «выразившиеся»;
+    * «нарушены требования …, п. 8.1, 8.8 ГОСТ Р 50597-2017, выразившиеся» — до слова «выразившиеся»
+      (перенос строки и запятая перед «ГОСТ» допускаются; «и.» вместо «п.» — как ошибка OCR);
     * «выразившиеся в …: 1) п. 6.3.1 ГОСТ 50597-2017 — …; 2) п. 8.1.17 ГОСТ 52289-2019 — …» — ссылки
       внутри блока описания нарушения (список после слова «выразившиеся»).
     """
@@ -525,9 +634,10 @@ def _find_gost(text: str, start: int, res: ParseResult) -> None:
         for point, gost, frag in items:
             add(m.start(), point, gost, _squash(m.group(0)), frag)
     for m in _REQUIREMENTS.finditer(text, start):
+        # До «выразившиеся», но не только до конца строки: OCR часто переносит
+        # «п. 6.3.1, ГОСТ 50597-2017» на следующую строку.
         stop = _EXPRESSED.search(text, m.end(), m.end() + 2000)
-        nl = text.find("\n", m.end())
-        end = stop.start() if stop else (nl if nl != -1 else len(text))
+        end = stop.start() if stop else min(len(text), m.end() + 500)
         i = m.end()
         while i < end:
             r = _REF.search(text, i, end)
